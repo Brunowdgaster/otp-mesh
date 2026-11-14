@@ -1,0 +1,49 @@
+name: ci
+
+# O CI roda a suite de propriedades e o teste de fumaca do ambiente. A rampa de
+# capacidade NAO entra: ela mede a maquina, e runner compartilhado nao serve de
+# linha de base -- licao que o P01 aprendeu medindo binarios identicos em dois
+# runners e obtendo 54% de diferenca.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  elixir:
+    runs-on: ubuntu-latest
+    name: nucleo OTP
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          elixir-version: '1.18'
+      - name: compilar com avisos como erro
+        working-directory: elixir/mesh
+        run: mix compile --warnings-as-errors
+      - name: formatacao
+        working-directory: elixir/mesh
+        run: mix format --check-formatted
+      - name: testes de propriedade (caos e contrapressao)
+        working-directory: elixir/mesh
+        run: mix test
+      # Uma rampa curta, so para provar que o benchmark executa. O numero dele
+      # nao e comparavel entre execucoes do CI.
+      - name: benchmark executa (rampa curta)
+        working-directory: elixir/mesh
+        run: |
+          sed 's/^degraus = .*/degraus = [1_000, 10_000]/' bench/capacity.exs > /tmp/short.exs
+          mix run /tmp/short.exs
+
+  ambiente:
+    runs-on: ubuntu-latest
+    name: teste de fumaca do ambiente
+    steps:
+      - uses: actions/checkout@v5
+      - name: provisionar
+        run: sudo bash setup.sh
+      # So o estagio das linguagens: 'infra' sobe um cluster kind, que no
+      # runner duplicaria o que o job acima ja cobre a um custo bem maior.
+      - name: smoke das linguagens
+        run: bash tests/smoke.sh langs
