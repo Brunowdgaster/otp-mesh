@@ -76,6 +76,14 @@ jobs:
   nif:
     runs-on: ubuntu-latest
     name: NIF em Rust
+    # A variavel vale para o job inteiro, e tem de valer: `deps/0` em mix.exs so
+    # declara o rustler quando ela esta definida. Com ela apenas nos passos de
+    # compilar e testar, o `mix deps.get` devolvia zero dependencias e a
+    # compilacao seguinte falhava por rustler ausente -- o espelho exato do erro
+    # anterior, em que o rustler era sempre declarado e os jobs do nucleo
+    # quebravam por nao rodarem deps.get.
+    env:
+      MESH_BUILD_NIF: '1'
     steps:
       - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
@@ -88,21 +96,15 @@ jobs:
         run: mix deps.get
       - name: compilar com o NIF
         working-directory: elixir/mesh
-        env:
-          MESH_BUILD_NIF: '1'
         run: mix compile --force --warnings-as-errors
       - name: testes, incluindo os 9 do NIF
         working-directory: elixir/mesh
-        env:
-          MESH_BUILD_NIF: '1'
         run: mix test --force
       # Rampa curta: o numero do benchmark depende da maquina, e runner
       # compartilhado nao serve de linha de base. Aqui o objetivo e so provar
       # que o benchmark executa.
       - name: benchmark da travessia executa
         working-directory: elixir/mesh
-        env:
-          MESH_BUILD_NIF: '1'
         run: mix run bench/nif.exs
 
   gleam:
