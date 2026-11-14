@@ -71,6 +71,28 @@ jobs:
           go run ./cmd/loadgen -addr 127.0.0.1:8099 -n 200 -hold 2s
           curl -fsS http://127.0.0.1:8099/stats
 
+  # O teste que atravessa as duas linguagens. Testes de unidade dos dois lados
+  # passariam mesmo com o protocolo divergindo: o enquadramento so e exercitado
+  # de verdade quando os bytes atravessam.
+  integracao:
+    runs-on: ubuntu-latest
+    name: integracao Go <-> Elixir
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          elixir-version: '1.18'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+      - name: dependencias do Elixir
+        working-directory: elixir/mesh
+        run: mix compile
+      - name: integracao de ponta a ponta
+        run: N=300 bash tests/integracao.sh
+
   ambiente:
     runs-on: ubuntu-latest
     name: teste de fumaca do ambiente

@@ -9,13 +9,16 @@ defmodule Mesh.Application do
   referências mortas, e é por isso que ele é o primeiro e nunca é derrubado
   pelo caos.
 
-      Mesh.Supervisor            (:one_for_one)
-      ├── Mesh.Registry          partitioned, :unique
-      ├── Mesh.Stats             GenServer, estado reconstruível
-      └── Mesh.ConnSupervisor    DynamicSupervisor
-          ├── Mesh.Connection    :temporary
-          ├── Mesh.Connection    :temporary
-          └── ...
+      Mesh.Supervisor              (:one_for_one)
+      ├── Mesh.Registry            partitioned, :unique
+      ├── Mesh.PubSub              partitioned, :duplicate (difusao)
+      ├── Mesh.Stats               GenServer, estado reconstruível
+      ├── Mesh.ConnSupervisor      DynamicSupervisor
+      │   ├── Mesh.Connection      :temporary
+      │   └── ...
+      ├── Mesh.Bridge.Supervisor   DynamicSupervisor
+      │   └── Mesh.Bridge.Handler  :temporary, um por gateway
+      └── Mesh.Bridge              listener TCP, packet: 4
 
   ## A decisão que mais importa aqui: conexões são `:temporary`
 
@@ -56,7 +59,18 @@ defmodule Mesh.Application do
       # medido com a mesma carga do bench/capacity.exs. Compra ~3x na difusão.
       {Registry, keys: :duplicate, name: Mesh.PubSub, partitions: System.schedulers_online()},
       Mesh.Stats,
-      {DynamicSupervisor, name: Mesh.ConnSupervisor, strategy: :one_for_one}
+      {DynamicSupervisor, name: Mesh.ConnSupervisor, strategy: :one_for_one},
+      # Supervisor dos handlers da ponte, antes da ponte em si: o aceitador
+      # cria filhos aqui, e criar filho num supervisor que ainda nao subiu
+      # falharia na primeira conexao de gateway.
+      {DynamicSupervisor, name: Mesh.Bridge.Supervisor, strategy: :one_for_one},
+      # A porta vem da configuracao. `nil` nao sobe a ponte, `0` deixa o SO
+      # escolher -- e o que permite a mesma arvore rodar em teste, em CI e em
+      # uso sem disputar porta fixa.
+      {Mesh.Bridge, port: Application.get_env(:mesh, :bridge_port)},
+      # Telemetria periódica, desligada por padrão: `:ignore` quando o
+      # intervalo não está configurado.
+      {Mesh.Reporter, interval_ms: Application.get_env(:mesh, :report_interval_ms)}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: Mesh.Supervisor)

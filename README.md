@@ -30,11 +30,11 @@ conexões      abrir (ms)   BEAM (MB)  bytes/conn  broadcast (ms)
   contagem após reinício: 490000 (relida do Registry)
 ```
 
-> **Status:** o **núcleo em Elixir/OTP e o gateway em Go estão completos e
-> medidos**, mas ainda **não se falam** — a ponte entre os dois é a próxima
-> etapa, e o README não finge o contrário. As outras sete linguagens previstas
-> no plano (Erlang, Gleam, Rust, Scala, Clojure, HCL, YAML) ainda não foram
-> integradas; o ambiente delas está instalado e verificado, ver
+> **Status:** o **núcleo em Elixir/OTP, o gateway em Go e a ponte entre os
+> dois** estão completos e medidos — 500 WebSockets reais viram 500 processos
+> supervisionados, verificado por teste de integração no CI. As outras cinco
+> linguagens previstas no plano (Erlang, Gleam, Rust, Scala, Clojure) e o HCL
+> ainda não foram integradas; o ambiente delas está instalado e verificado, ver
 > [Estado atual](#estado-atual).
 
 ## Objetivo
@@ -237,6 +237,76 @@ preenchido não aparece no RSS, então a métrica subestima buffers grandes e
 ociosos. A medição honesta de buffer grande exigiria forçar tráfego que o
 preencha, e está no roadmap.
 
+### A ponte: 500 WebSockets reais viram 500 processos supervisionados
+
+O gateway e o núcleo eram dois resultados independentes, e o README dizia isso.
+Agora falam por uma ponte TCP, e o teste de integração atravessa as duas
+linguagens:
+
+```
+$ bash tests/integracao.sh
+
+  ok   build do Go
+  ok   núcleo em Elixir escutando a ponte em 4141
+  ok   gateway conectado à ponte
+  ok   /stats confirma nucleo_ligado=true
+  conexões no gateway : 500
+  conexões no núcleo  : 500
+  ok   o gateway aceitou 500 de 500 WebSockets reais
+  ok   o NÚCLEO vê 500 conexões: a ponte funciona de ponta a ponta
+  após fechar a carga : 0 no núcleo
+  ok   fechar os WebSockets limpou as conexões no núcleo
+
+7 passaram, 0 falharam
+```
+
+**Por que esse teste é obrigatório:** testes de unidade dos dois lados passariam
+mesmo com o protocolo divergindo. O enquadramento só é exercitado de verdade
+quando os bytes atravessam — e divergência de formato não dá exceção, dá
+comportamento errado silencioso.
+
+O protocolo tem quatro tipos de quadro: `CONNECT`, `DISCONNECT`, `DATA` (do
+gateway para o núcleo) e `PUSH` (de volta, para o núcleo entregar a um
+cliente). Decisões que valem explicação:
+
+**O enquadramento é da VM.** A opção `packet: 4` do `inet` prefixa e consome um
+tamanho de 32 bits. Do lado Elixir ninguém escreve "li metade de um quadro";
+do lado Go são quatro bytes à mão. Alternativas descartadas: distribuição
+Erlang (o Go teria de falar o protocolo da BEAM, desproporcional para três
+eventos), NATS (broker num enlace ponto a ponto) e HTTP por evento (inviável na
+escala medida).
+
+**O id do cliente é escopado pelo socket do handler.** Dois gateways numerando
+clientes a partir de 1 colidiriam no `Registry`, que tem `keys: :unique`, e a
+colisão apareceria como `already_started` num cliente legítimo. Há teste para
+dois gateways usando os mesmos ids.
+
+**Gateway que cai fecha as conexões que abriu.** O `terminate/2` do handler
+chama `Mesh.close/1` para cada cliente registrado. Sem isso, elas ficariam
+vivas no `Registry` sem ninguém do outro lado — e a contagem de conexões
+deixaria de significar algo. Há teste que fecha o socket sem `DISCONNECT`
+nenhum, que é o que acontece quando o processo do gateway morre.
+
+**Quadro malformado não derruba o handler.** Um gateway com bug não deve levar
+consigo todas as conexões dele. Há teste que envia três bytes soltos e verifica
+que o handler segue aceitando quadros.
+
+### O bug de OTP que o teste de integração expôs
+
+A primeira versão da ponte aceitava conexões dentro de `handle_continue/2`,
+devolvendo `{:continue, :aceitar}` a cada iteração. Parece idiomático — e está
+errado: **enquanto um GenServer processa continuações, ele não volta à caixa de
+mensagens**. O `GenServer.call(Mesh.Bridge, :port)` nunca era atendido, e sete
+testes falhavam com timeout de 5 s.
+
+Aceitar é uma operação bloqueante de duração indefinida; quem bloqueia não pode
+ser o mesmo processo que responde chamadas. O laço foi para um processo
+`spawn_link`: se ele morrer, a ponte morre com ele e o supervisor reconstrói os
+dois — que é o correto, porque um listener sem aceitador é um listener inútil.
+
+*Lição:* `handle_continue` serve para continuar uma inicialização, não para
+rodar um laço. A diferença só aparece quando alguém tenta falar com o processo.
+
 ### Os limites que aparecem antes da memória
 
 Medir sockets em loopback esbarra em três tetos de kernel antes de esbarrar em
@@ -297,6 +367,7 @@ mix run bench/fanout.exs       # as três difusões, intercaladas
 
 cd ../../go && go test ./...   # 7 testes do WebSocket, zero dependências
 cd .. && bash bench/gateway.sh # custo de uma conexão real + efeito dos buffers
+bash tests/integracao.sh       # Go <-> Elixir de ponta a ponta
 ```
 
 O benchmark para sozinho ao passar de 2 GB no BEAM. O limite é deliberado:
@@ -315,16 +386,20 @@ um benchmark que mata o ambiente não é um benchmark.
       └── ... 700.000
 ```
 
-O gateway em Go fica ao lado, e por enquanto **não** está ligado ao núcleo:
+O gateway em Go e o núcleo falam por uma ponte TCP:
 
 ```
-  cliente WebSocket ──▶ gateway (Go)        │  núcleo (Elixir/OTP)
-                        1 goroutine/conn    │  1 processo/conn
-                        ~7,1 KB/conn        │  ~3,8 KB/conn
-                        ws/ sem dependência │  Registry + supervisão
-                                            │
-                        a ponte entre os dois é a próxima etapa
+  cliente WebSocket ──▶ gateway (Go) ──TCP──▶ ponte ──▶ núcleo (Elixir/OTP)
+                        1 goroutine/conn     packet:4   1 processo/conn
+                        ~7,1 KB/conn                    ~3,8 KB/conn
+                        ws/ sem dependência             Registry + supervisão
+                             ◀──────── PUSH ────────────
 ```
+
+O enquadramento é **da VM**: a opção `packet: 4` do `inet` prefixa e consome um
+tamanho de 32 bits, então nem o handler em Elixir nem o lado em Go precisam de
+máquina de estado para "li metade de um quadro". É uma das coisas que a BEAM dá
+de graça e que num runtime comum custa uma biblioteca.
 
 Três decisões estruturais:
 
@@ -465,10 +540,12 @@ etapa.
   200 mil conexões com oito escalonadores; a próxima barreira é a emissão de
   `cast` em si, que é uma mensagem por destino. Reduzir isso exigiria agrupar
   destinatários por nó ou trocar difusão por *pull*, o que muda a semântica.
-- **O gateway e o núcleo ainda não se falam.** O gateway em Go aceita
-  WebSocket de verdade e está medido, mas não cria `Mesh.Connection` do outro
-  lado: a ponte entre os dois é a próxima etapa. Até ela existir, são dois
-  resultados independentes, e o README não finge o contrário.
+- **A ponte não tem reconexão automática.** Se o núcleo cair, o gateway
+  continua servindo WebSocket mas perde o núcleo até ser reiniciado — degrada
+  em vez de recusar, e `/stats` mostra `nucleo_ligado: false` para que a
+  degradação seja visível. Reconexão com *backoff* está no roadmap.
+- **A ponte é um nó só.** Um gateway fala com um núcleo; não há descoberta nem
+  balanceamento entre vários núcleos.
 - **As conexões do núcleo são simuladas.** Não há socket nos 700 mil: são
   processos com estado, que é o que aquela medição quer isolar. O custo do
   socket real está medido separadamente, no gateway.
@@ -492,9 +569,11 @@ etapa.
    comparadas, custo de memória estabelecido em +7% por conexão.
 2. ~~**Gateway em Go** com WebSocket real~~ **Feito.** ~7,1 KB por conexão
    contra 3,8 KB do processo BEAM, e o efeito do tamanho dos buffers medido.
-3. **A ponte gateway ↔ núcleo**, para que um WebSocket real crie um
-   `Mesh.Connection` do outro lado.
-4. **Buffers de kernel por socket**, via `/proc/net/sockstat`, para fechar a
+3. ~~**A ponte gateway ↔ núcleo**~~ **Feita.** TCP com `packet: 4`, quatro
+   tipos de quadro, bidirecional, com teste de integração no CI.
+4. **Reconexão da ponte com *backoff***, para o gateway sobreviver a um núcleo
+   que reinicia.
+5. **Buffers de kernel por socket**, via `/proc/net/sockstat`, para fechar a
    conta de memória de uma conexão real.
 3. **Supervisão em Erlang puro** do mesmo núcleo, para a comparação que o
    projeto promete: a mesma árvore em Elixir e em Erlang, lado a lado.
@@ -520,6 +599,10 @@ etapa.
   devolvia medição não convergida em silêncio, como o do P01. Saber que um
   modo de falha existe não impede de reintroduzi-lo — o que impede é a
   ferramenta reclamar.
+- **`handle_continue` não é lugar de laço.** Enquanto um GenServer processa
+  continuações, ele não atende chamadas — e o sintoma apareceu longe da causa:
+  sete testes com timeout, nenhum deles sobre aceitação de conexão. Quem
+  bloqueia não pode ser quem responde.
 - **Um socket real custa menos do que eu esperava: 1,9x um processo BEAM.** O
   folclore diz "milhares contra milhões"; medido, a diferença entre uma
   goroutine com socket e um processo sem socket é 7,1 KB contra 3,8 KB. O que
@@ -564,13 +647,14 @@ etapa.
 | Conexão como processo, com contrapressão | ✅ |
 | Caos: matar fração das conexões | ✅ supervisor sobrevive, convergência medida |
 | Caos: matar processo `:permanent` | ✅ reinício em 5,83 ms, estado reconstruído |
-| Suíte ExUnit | ✅ 10/10, estável em 15 execuções seguidas |
+| Suíte ExUnit | ✅ 17/17, estável em 15 execuções seguidas |
 | Benchmark de capacidade | ✅ 700 mil conexões, 3.783 bytes cada |
 | Benchmark de difusão, 3 implementações | ✅ intercalado, com dispersão reportada |
 | Fanout particionado | ✅ ~3x medido; +7% de memória por conexão |
 | Gateway em Go, WebSocket real | ✅ zero dependências, 7 testes, ~7,1 KB/conn |
 | Efeito do tamanho dos buffers | ✅ +35 % com o padrão das bibliotecas |
-| Ponte gateway ↔ núcleo | ⬜ |
+| Ponte gateway ↔ núcleo | ✅ TCP `packet: 4`, 7 testes + integração no CI |
+| Teste de integração entre as linguagens | ✅ 500 WebSockets → 500 processos |
 | Erlang, Gleam, Rust, Scala, Clojure | ⬜ ambiente pronto, não integrados |
 | Distribuição entre nós | ⬜ |
 | NATS, OpenTofu, kind em uso | ⬜ instalados e verificados, não integrados |
