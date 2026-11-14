@@ -17,3 +17,7 @@ go/loadgen
 # Rust NIF
 elixir/mesh/native/*/target/
 elixir/mesh/priv/native/
+
+# scala-cli
+scala/*/.scala-build/
+scala/*/.bsp/

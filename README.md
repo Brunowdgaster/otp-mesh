@@ -33,8 +33,8 @@ conexões      abrir (ms)   BEAM (MB)  bytes/conn  broadcast (ms)
 > **Status:** o **núcleo em Elixir/OTP, o gateway em Go e a ponte entre os
 > dois** estão completos e medidos — 500 WebSockets reais viram 500 processos
 > supervisionados, verificado por teste de integração no CI. As outras quatro
-> linguagens previstas no plano (Scala, Clojure) e o HCL ainda não foram
-> integradas; o ambiente delas está instalado e verificado, ver
+> linguagens previstas no plano (Clojure) e o HCL ainda não foram integradas;
+> o ambiente delas está instalado e verificado, ver
 > [Estado atual](#estado-atual).
 
 ## Objetivo
@@ -461,6 +461,130 @@ Tentei `Application.compile_env/3`, que o mix rastreia — e é pior: a validaç
 roda **antes** da compilação e **aborta** exigindo recompilação manual, em vez de
 fazê-la. Ficou o `--force` explícito, documentado em "Como rodar".
 
+### Scala e Loom: o número de memória era a parte menos interessante
+
+O projeto mede **3.534 bytes por conexão** na BEAM, e esse número só significa
+algo contra outra coisa. A JVM oferece duas respostas para "uma unidade de
+concorrência bloqueada", e a segunda é o análogo direto do processo da BEAM:
+
+| | o que é |
+|---|---|
+| **thread de plataforma** | uma thread do sistema operacional, com pilha própria reservada |
+| **thread virtual** (Loom, JDK 21+) | multiplexada sobre poucas threads carregadoras, pilha no heap, crescendo sob demanda |
+
+Loom promete a mesma coisa que a BEAM: *crie uma por conexão, bloquear é de
+graça*. Esta seção mede se a promessa é a mesma.
+
+#### Medindo o primitivo nu, pelo mesmo método
+
+A comparação mais fácil de fazer errado aqui seria pôr os 3.534 bytes da conexão
+ao lado dos bytes de uma thread virtual: a conexão é um GenServer com estado e
+**duas** entradas de `Registry`, a thread virtual bloqueia numa fila e nada
+mais. Estado diferente, custo diferente, comparação sem sentido.
+
+Então `bench/processo_nu.exs` mede o **processo nu da BEAM** — `spawn` +
+`receive`, nada mais — pelo mesmo método do lado da JVM: RSS lido de
+`/proc/self/status` antes e depois, dividido pelo número de unidades.
+
+**Por que RSS e não `:erlang.memory`:** porque é a única métrica que atravessa a
+fronteira. `:erlang.memory` enxerga o heap da BEAM e **não enxerga** pilhas de
+threads do sistema operacional — medir a JVM assim daria ~0 bytes por thread de
+plataforma, que é exatamente a conclusão errada.
+
+| primitivo | criados | **bytes por unidade (RSS)** | criação/s |
+|---|---|---|---|
+| thread de plataforma | **30.568, então OOM** | 23.502 | 702 |
+| processo da BEAM | 700.000 | **2.732** | **122.079** |
+| thread virtual (Loom) | 700.000 | **1.323** | 38.015 |
+
+Três resultados, em ordem de surpresa:
+
+**A thread de plataforma bate num muro em 30 mil**, com
+`OutOfMemoryError: unable to create native thread`. Ela reservou **30 GiB** em
+pilhas (30.568 × 1 MiB), **44,6x o RSS medido** — porque a pilha de 1 MiB é
+mapeada preguiçosamente e a thread bloqueada toca poucas páginas. É o muro que
+justifica Loom ter sido criado.
+
+> Reportar só o RSS faria a thread de plataforma parecer barata; reportar só o
+> reservado faria parecer catastrófica. O RSS é o número comparável com a BEAM;
+> o reservado é o que esgota o espaço de endereçamento **antes** de a memória
+> acabar. As duas colunas existem porque uma sozinha mente.
+
+**A thread virtual é mais barata que o processo da BEAM** — 1.323 contra 2.732
+bytes, quase a metade. Esse é o resultado que contraria o senso comum, e ele é
+real.
+
+**A BEAM cria 3,2x mais rápido** — 122 mil por segundo contra 38 mil.
+
+#### Por que a thread virtual é mais barata: ela compra menos
+
+Se a seção parasse na tabela acima, a conclusão seria "Loom ganhou". O
+experimento seguinte é o que faltava.
+
+Threads virtuais são escalonadas **cooperativamente**: cedem o carregador num
+ponto de bloqueio (I/O, `sleep`, `lock`). Um laço que só calcula **não tem ponto
+de cedência**. A BEAM escalona **preemptivamente por contagem de reduções**:
+cada processo recebe um orçamento de ~4.000 reduções e é interrompido ao gastá-lo,
+queira ou não.
+
+Mesmo experimento nos dois: **4 unidades em laço fechado sobre 2
+escalonadores**, medindo quanto uma unidade nova demora para rodar sua primeira
+instrução.
+
+| | sem carga | sob carga de CPU | degradação |
+|---|---|---|---|
+| **processo da BEAM** | 0,008 ms | **0,170 ms** | 21x |
+| **thread virtual** | 0,318 ms | **≥ 10.000 ms** | **nunca rodou** |
+
+A thread virtual **não rodou dentro do teto de 10 segundos**. Não é latência
+alta: é inanição. Ela esperaria os laços terminarem.
+
+Em um servidor, essa é a diferença entre *"uma requisição pesada deixa as outras
+lentas"* e *"uma requisição pesada trava as outras"*.
+
+E note a primeira coluna: sem carga nenhuma, a BEAM atende em 0,008 ms contra
+0,318 ms — **40x mais rápido** para criar e escalonar uma unidade de
+concorrência.
+
+#### Sendo justo com Loom
+
+Isto **não é defeito**: é a troca que Loom fez de propósito. Em carga
+dominada por I/O — que é o caso de uso que Loom tem como alvo — toda operação de
+rede é um ponto de cedência, e a inanição acima não acontece.
+
+O problema aparece em carga **mista**: um endpoint que serializa um JSON grande,
+comprime um relatório ou faz um laço de cálculo no meio de um serviço I/O-bound.
+Na BEAM esse endpoint fica lento. Na JVM com threads virtuais, ele para os
+vizinhos.
+
+A afirmação honesta é esta: **os 1.323 bytes são mais baratos que os 2.732
+porque não carregam escalonamento preemptivo, heap isolado por processo nem
+supervisão.** O número de memória era a parte menos interessante da comparação.
+
+#### Três detalhes de método que decidiram o resultado
+
+**Um processo JVM por modo.** `Concorrencia.scala` mede um modo por execução.
+Criar 30 mil threads de plataforma e então medir as virtuais no mesmo processo
+mediria o heap já crescido, as páginas já faultadas e o GC já aquecido pelo
+primeiro modo. É a mesma disciplina de `bench/capacity.exs`: o A/B limpo exige
+processos separados, e a comparação é feita por quem os invoca.
+
+**O tamanho da pilha é lido, não assumido.** `-XX:ThreadStackSize` é
+configurável e o padrão varia por plataforma. Publicar "reservado = N × 1 MiB"
+por suposição seria inventar o número mais importante da tabela, então ele vem
+do `HotSpotDiagnosticMXBean` — e a função **falha alto** se o MXBean não
+existir, em vez de devolver um palpite.
+
+**O paralelismo da BEAM foi reduzido para espelhar a JVM.** Sem
+`schedulers_online: 2`, a BEAM usaria os 8 núcleos, sobrariam escalonadores
+livres, e o teste não teria medido preempção: teria medido que havia núcleo
+sobrando. É o detalhe que decide se o resultado significa algo.
+
+Também: o laço dos *hogs* precisa de uma condição que o JIT não elimine
+(`AtomicBoolean`), senão o experimento mede um laço otimizado para fora — e a
+conclusão seria "não houve inanição" por um motivo que nada tem a ver com
+escalonamento.
+
 ### O gateway em Go: quanto custa um socket de verdade
 
 O núcleo mediu 3,8 KB por conexão — mas aquelas conexões são processos BEAM
@@ -649,6 +773,16 @@ cd gleam/mesh_codec && gleam test  # codec tipado, contra os mesmos vetores
 cd ../../elixir/mesh
 MESH_BUILD_NIF=1 mix test --force       # inclui os 9 testes do NIF
 MESH_BUILD_NIF=1 mix run bench/nif.exs  # custo da travessia BEAM<->Rust
+
+# Concorrencia: BEAM contra JVM, pelo mesmo metodo.
+# Um processo por modo, de proposito -- ver a secao do Scala.
+mix run bench/processo_nu.exs 700000      # processo nu da BEAM: bytes/unidade
+mix run bench/preempcao.exs 4 2           # latencia sob carga de CPU
+
+cd ../../scala/loadgen
+scala-cli run Concorrencia.scala -- platform 64000   # bate o muro em ~30 mil
+scala-cli run Concorrencia.scala -- virtual  700000  # 1.323 bytes/unidade
+scala-cli run Preempcao.scala    -- 4 2              # inanicao: nunca roda
 ```
 
 O benchmark para sozinho ao passar de 2 GB no BEAM. O limite é deliberado:
@@ -698,6 +832,7 @@ Três decisões estruturais:
 |---|---|---|---|
 | **Go 1.26** | gateway WebSocket, gerador de carga | Uma goroutine por conexão é o par natural de um processo por conexão, e o `net/http` com `Hijacker` dá o socket cru sem intermediário. É também a comparação que o projeto quer: a plataforma onde "um por conexão" é barato **sem** supervisão nem isolamento de falha | **Node.js**: um laço de eventos, não um por conexão — mediria outra coisa. **Rust**: mais rápido e sem GC, mas `async` exige escolher runtime, e aí a medição seria do Tokio |
 | **`ws/` escrito à mão** (zero dependências) | aperto de mão e quadros da RFC 6455 | O custo por conexão é dominado pelos buffers, e em biblioteca eles são escolha dela. Com `ws.Config` explícito, a tabela de efeito dos buffers existe — e ela mostra +35 % para o padrão herdado | **gorilla/websocket**, **coder/websocket**: ambas boas e livres; esconderiam justamente a variável sob medição |
+| **Scala 3.10 + JDK 25** | `scala/loadgen`, custo e escalonamento da concorrência | Loom promete o que a BEAM promete — "crie uma por conexão" — e a comparação direta é o que dá sentido aos 3.534 bytes do projeto. Resultado: a thread virtual é **mais barata** (1.323 contra 2.732 bytes) e **sofre inanição completa** sob carga de CPU, onde a BEAM degrada 21x. Mede também o muro da thread de plataforma: 30.568 e OOM | **Akka/Pekko ou Cats Effect**: trariam seu próprio escalonador e mediriam a biblioteca, não a plataforma. O JDK tem `Thread.ofVirtual` e cliente WebSocket embutidos, então o projeto segue sem dependências |
 | **Rust 1.93 + rustler** | `native/mesh_nif`, codec como NIF | Existe para **medir o custo da travessia** BEAM↔nativo, que é a decisão que todo projeto BEAM enfrenta e quase ninguém mede. Resultado: ~30 ns por chamada, e o NIF não venceu acima do ruído em nenhum tamanho até 1 MiB | **NIF à mão contra a ABI do `erl_nif.h`**: dezenas de linhas de `unsafe extern "C"` e conversão manual de termos — mediria a qualidade do meu boilerplate, não o custo real. `rustler` é o que se usaria de verdade |
 | **Gleam 1.19** | `gleam/mesh_codec`, terceira implementação do protocolo | Tipagem estática sobre a BEAM: o quadro deixa de ser convenção e passa a ser tipo, e três classes de erro migram de tempo de execução para tempo de compilação. O `@external` para `file:read_file/1` mostra que chamar OTP de Gleam é chamada de função, não FFI | **`simplifile`** para o I/O: traria dependência e esconderia justamente o ponto de que Gleam é BEAM |
 | **Erlang/OTP 27** | `src/mesh_conn.erl`, conexão alternativa no mesmo nó | É a prova de que Elixir e Erlang são a mesma plataforma: o `mix` compila `src/*.erl` no mesmo app, e a conexão Erlang entra na mesma árvore, no mesmo `Registry`, recebendo a mesma difusão. Escrever a versão em Erlang também expôs um bug que o Elixir escondia — `{via, Modulo, Nome}` com módulo e nome conflatados | **Repositório separado com nó distribuído**: mostraria interoperação entre nós, que é outra coisa — e esconderia justamente o fato de ser um nó só |
@@ -885,6 +1020,11 @@ etapa.
   devolvia medição não convergida em silêncio, como o do P01. Saber que um
   modo de falha existe não impede de reintroduzi-lo — o que impede é a
   ferramenta reclamar.
+- **A plataforma mais leve não é a mais barata, e o número de memória era a
+  parte menos interessante.** A thread virtual do Loom custa 1.323 bytes contra
+  2.732 do processo da BEAM — e **nunca rodou** sob carga de CPU, onde a BEAM
+  degradou 21x. Ela é mais barata porque não carrega escalonamento preemptivo,
+  heap isolado nem supervisão. Medir só memória teria dado a conclusão oposta.
 - **"Escreve em Rust que fica mais rápido" é folclore, e agora tenho o
   número.** A travessia custa **~30 ns por chamada** (reproduzido em três
   execuções, ±3%). Até 4 KiB o Elixir ganha de forma estabelecida — em payload
@@ -970,8 +1110,9 @@ etapa.
 | **Erlang** no mesmo nó | ✅ `mesh_conn.erl`, 5 testes, benchmark comparativo |
 | **Gleam** — codec tipado do protocolo | ✅ 13 testes, conformes aos vetores |
 | **Rust** — codec como NIF | ✅ 9 testes, travessia em ~30 ns (3 execuções, ±3%) |
+| **Scala** — BEAM vs Loom | ✅ 1.323 vs 2.732 bytes/unidade; inanição medida |
 | Protocolo verificado em 4 linguagens | ✅ Elixir, Go, Gleam e Rust contra `protocolo/vetores.txt` |
-| Scala, Clojure | ⬜ ambiente pronto, não integrados |
+| Clojure | ⬜ ambiente pronto, não integrado |
 | Distribuição entre nós | ⬜ |
 | NATS, OpenTofu, kind em uso | ⬜ instalados e verificados, não integrados |
 | CI | ⬜ |

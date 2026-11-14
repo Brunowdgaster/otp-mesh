@@ -107,6 +107,41 @@ jobs:
         working-directory: elixir/mesh
         run: mix run bench/nif.exs
 
+  # O Scala mede concorrencia, e o numero depende da maquina -- runner
+  # compartilhado nao serve de linha de base (o p01 descobriu que dois runners
+  # identicos dao 631 e 411 Mops/s). Aqui o job prova que os dois programas
+  # COMPILAM E EXECUTAM, com alvos pequenos. Os numeros publicados no README
+  # vem da maquina local, e isso esta dito lá.
+  scala:
+    runs-on: ubuntu-latest
+    name: concorrencia em Scala
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          # 21+ e obrigatorio: Thread.ofVirtual nao existe antes.
+          java-version: '21'
+      - uses: VirtusLab/scala-cli-setup@v1
+        with:
+          jvm: '21'
+      - name: compila
+        working-directory: scala/loadgen
+        run: scala-cli compile . --jvm system
+      # Alvo pequeno de proposito: o muro da thread de plataforma (30.568
+      # nesta maquina) depende de memoria e de limites do sistema, e no runner
+      # seria outro numero. O passo verifica que a rampa EXECUTA e reporta,
+      # nao que o muro esta em algum lugar especifico.
+      - name: rampa de thread de plataforma executa
+        working-directory: scala/loadgen
+        run: scala-cli run Concorrencia.scala --jvm system -- platform 4000
+      - name: rampa de thread virtual executa
+        working-directory: scala/loadgen
+        run: scala-cli run Concorrencia.scala --jvm system -- virtual 50000
+      - name: inanicao sob carga de CPU
+        working-directory: scala/loadgen
+        run: scala-cli run Preempcao.scala --jvm system -- 4 2
+
   gleam:
     runs-on: ubuntu-latest
     name: codec em Gleam
