@@ -1,0 +1,11 @@
+erl_crash.dump
+_build/
+deps/
+.elixir_ls/
+*.beam
+build/
+target/
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate*
+*.tfstate.backup
