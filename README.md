@@ -4,6 +4,10 @@ Núcleo de uma plataforma de presença em Elixir/OTP: um processo BEAM por
 conexão, registro particionado, contrapressão por descarte e uma árvore de
 supervisão que sobrevive a matar 30% das conexões de uma vez.
 
+Mais um gateway WebSocket em Go, sem dependências, que responde a pergunta
+seguinte: **um socket de verdade custa 7,1 KB por conexão contra 3,8 KB do
+processo BEAM — 1,9x**, e não as ordens de grandeza do folclore.
+
 Projeto 03 de 14 de um portfólio poliglota — índice em
 [Brunowdgaster/poliglota](https://github.com/Brunowdgaster/poliglota).
 
@@ -26,10 +30,12 @@ conexões      abrir (ms)   BEAM (MB)  bytes/conn  broadcast (ms)
   contagem após reinício: 490000 (relida do Registry)
 ```
 
-> **Status:** o **núcleo em Elixir/OTP está completo e medido**. As outras oito
-> linguagens previstas no plano (Erlang, Gleam, Go, Rust, Scala, Clojure, HCL,
-> YAML) ainda não foram integradas — o ambiente delas está instalado e
-> verificado, ver [Estado atual](#estado-atual).
+> **Status:** o **núcleo em Elixir/OTP e o gateway em Go estão completos e
+> medidos**, mas ainda **não se falam** — a ponte entre os dois é a próxima
+> etapa, e o README não finge o contrário. As outras sete linguagens previstas
+> no plano (Erlang, Gleam, Rust, Scala, Clojure, HCL, YAML) ainda não foram
+> integradas; o ambiente delas está instalado e verificado, ver
+> [Estado atual](#estado-atual).
 
 ## Objetivo
 
@@ -183,6 +189,83 @@ número.
 *Lição, de novo:* o instrumento de medição precisa ser verificado como o
 sistema. `:erlang.memory/1` é correto; chamá-lo no lugar errado não é.
 
+### O gateway em Go: quanto custa um socket de verdade
+
+O núcleo mediu 3,8 KB por conexão — mas aquelas conexões são processos BEAM
+**sem socket**. A pergunta seguinte é quanto uma conexão real custa, e a
+resposta exigiu um gateway WebSocket, que é a segunda linguagem do projeto.
+
+Medido no gateway em Go, uma goroutine por conexão, buffers de 1 KiB:
+
+| conexões | goroutines | heap | pilhas | RSS | bytes/conexão |
+|---|---|---|---|---|---|
+| 1.000 | 1.003 | 4,2 MB | 3,5 MB | 18,6 MB | 12.333 |
+| 5.000 | 5.003 | 24,0 MB | 10,4 MB | 44,3 MB | 7.865 |
+| 10.000 | 10.003 | 35,5 MB | 21,0 MB | 78,8 MB | 7.542 |
+| 25.000 | 25.003 | 129,4 MB | 49,6 MB | 176,8 MB | **7.130** |
+
+**Um socket real custa ~7,1 KB, contra 3,8 KB do processo BEAM: 1,9x.** Menos do
+que eu esperava — e o custo *cai* conforme a escala cresce, porque o RSS base do
+processo se amortiza.
+
+As pilhas de goroutine dão ~2 KB cada (49,6 MB / 25.000), não os 8 KiB que se
+costuma repetir: o Go começa com pilha pequena e cresce sob demanda.
+
+### Por que escrevi o WebSocket à mão
+
+`gorilla/websocket` e `coder/websocket` são boas, livres, e seriam a escolha
+óbvia num produto. Aqui atrapalhariam: o custo por conexão é **dominado pelo
+tamanho dos buffers**, e numa biblioteca eles são escolha dela.
+
+Com os buffers explícitos em `ws.Config`, a medição existe:
+
+| buffers (leitura/escrita) | RSS | bytes/conexão | vs 1 KiB |
+|---|---|---|---|
+| 512 B | 76,0 MB | 7.256 | −3 % |
+| **1 KiB** (escolhido) | 78,4 MB | 7.507 | — |
+| 4 KiB (padrão das bibliotecas) | 103,7 MB | 10.162 | **+35 %** |
+| 16 KiB | 99,5 MB | 9.726 | +30 % |
+
+Escolher 1 KiB em vez dos 4 KiB herdados economiza **35 % de memória por
+conexão**. Em 25 mil conexões isso é a diferença entre 177 MB e 240 MB; em 500
+mil, entre 3,5 GB e 4,8 GB — ou seja, entre caber e não caber.
+
+**A anomalia na última linha é real e vale registrar:** 16 KiB saiu *abaixo* de
+4 KiB, o que é fisicamente implausível. A causa não é ruído aleatório — é que
+**RSS conta só páginas tocadas**. Um buffer de 16 KiB alocado e nunca
+preenchido não aparece no RSS, então a métrica subestima buffers grandes e
+ociosos. A medição honesta de buffer grande exigiria forçar tráfego que o
+preencha, e está no roadmap.
+
+### Os limites que aparecem antes da memória
+
+Medir sockets em loopback esbarra em três tetos de kernel antes de esbarrar em
+RAM, e ignorá-los produziria um número que parece capacidade e é limite de
+configuração:
+
+| limite | padrão aqui | efeito |
+|---|---|---|
+| descritores (`ulimit -n`) | 10.240 | para em 10 mil conexões |
+| portas efêmeras | 32768–60999 | **~28 mil** — o cliente gasta uma por conexão |
+| backlog de accept | `somaxconn` 4096, `syn_backlog` 256 | rampa rápida descarta SYN |
+
+`bench/gateway.sh` ajusta os três, **registra os valores antigos e os
+restaura** — são ajustes de kernel, não é educado deixá-los para trás. O teto de
+portas efêmeras é o motivo de a medição parar em 25 mil e não em 700 mil: passar
+disso exige mais de uma máquina, ou endereços de origem adicionais.
+
+### O que o número NÃO inclui
+
+Os **buffers de socket do kernel**. Eles não aparecem no heap do Go nem no RSS
+do processo — são memória de kernel, contabilizada em slab — e no Linux partem
+de ~2–4 KiB por socket, podendo crescer com a janela TCP.
+
+A conta completa de uma conexão real é portanto maior que os 7,1 KB medidos.
+Quanto maior depende de `sysctl`, e medir isso exige ler
+`/proc/net/sockstat`: está no roadmap. Até lá, o número publicado é "7,1 KB no
+espaço do processo", não "7,1 KB no sistema" — e a diferença está declarada
+na própria saída de `/stats`.
+
 ## Ambiente: zero recursos pagos
 
 Todas as 14 ferramentas são software livre, nenhuma exige conta, cartão ou
@@ -211,6 +294,9 @@ cd elixir/mesh
 mix test                       # 8 testes: ciclo de vida, caos, contrapressão
 mix run bench/capacity.exs     # a rampa até 700 mil + caos + extrapolação
 mix run bench/fanout.exs       # as três difusões, intercaladas
+
+cd ../../go && go test ./...   # 7 testes do WebSocket, zero dependências
+cd .. && bash bench/gateway.sh # custo de uma conexão real + efeito dos buffers
 ```
 
 O benchmark para sozinho ao passar de 2 GB no BEAM. O limite é deliberado:
@@ -229,6 +315,17 @@ um benchmark que mata o ambiente não é um benchmark.
       └── ... 700.000
 ```
 
+O gateway em Go fica ao lado, e por enquanto **não** está ligado ao núcleo:
+
+```
+  cliente WebSocket ──▶ gateway (Go)        │  núcleo (Elixir/OTP)
+                        1 goroutine/conn    │  1 processo/conn
+                        ~7,1 KB/conn        │  ~3,8 KB/conn
+                        ws/ sem dependência │  Registry + supervisão
+                                            │
+                        a ponte entre os dois é a próxima etapa
+```
+
 Três decisões estruturais:
 
 1. **`Registry` particionado**, uma tabela ETS por escalonador. Com uma
@@ -243,6 +340,8 @@ Três decisões estruturais:
 
 | Ferramenta | Onde é usada | Por que ela, e não outra | Alternativa descartada |
 |---|---|---|---|
+| **Go 1.26** | gateway WebSocket, gerador de carga | Uma goroutine por conexão é o par natural de um processo por conexão, e o `net/http` com `Hijacker` dá o socket cru sem intermediário. É também a comparação que o projeto quer: a plataforma onde "um por conexão" é barato **sem** supervisão nem isolamento de falha | **Node.js**: um laço de eventos, não um por conexão — mediria outra coisa. **Rust**: mais rápido e sem GC, mas `async` exige escolher runtime, e aí a medição seria do Tokio |
+| **`ws/` escrito à mão** (zero dependências) | aperto de mão e quadros da RFC 6455 | O custo por conexão é dominado pelos buffers, e em biblioteca eles são escolha dela. Com `ws.Config` explícito, a tabela de efeito dos buffers existe — e ela mostra +35 % para o padrão herdado | **gorilla/websocket**, **coder/websocket**: ambas boas e livres; esconderiam justamente a variável sob medição |
 | **Elixir / OTP 27** | o núcleo inteiro | A BEAM é a única plataforma mainstream em que um processo por conexão é a escolha *óbvia* e não um truque: processo de centenas de bytes, escalonador preemptivo por redução, e supervisão como parte da linguagem e não biblioteca. Medir 700 mil processos supervisionados em 2,3 GB não é possível em runtime de threads do SO | **Go**: goroutines são baratas, mas não há supervisão nem isolamento de falha — um `panic` não contido derruba o processo todo. Go entra no gateway HTTP, onde é melhor |
 | **`Registry` particionado** | nomeação das conexões | Nomeação distribuída sem processo central: cada partição é uma tabela ETS, e o `Registry` monitora os processos para limpar sozinho quando morrem. É o que faz a convergência pós-caos ser automática | **GenServer com um `Map`**: um processo central vira gargalo e ponto único de falha, e perderia o estado ao reiniciar |
 | **`DynamicSupervisor`** | ciclo de vida das conexões | Filhos criados em tempo de execução, sem lista estática. Suporta `:temporary`, que é o que evita a tempestade de reinícios | **`Supervisor` com lista estática**: não serve, as conexões não são conhecidas de antemão |
@@ -366,10 +465,19 @@ etapa.
   200 mil conexões com oito escalonadores; a próxima barreira é a emissão de
   `cast` em si, que é uma mensagem por destino. Reduzir isso exigiria agrupar
   destinatários por nó ou trocar difusão por *pull*, o que muda a semântica.
-- **Conexões são simuladas.** Não há socket, nem TCP, nem WebSocket: são
-  processos com estado, que é o que o projeto quer medir. Um socket real
-  acrescentaria ~10 KB de buffers por conexão e mudaria o número de capacidade
-  — ponto que será medido quando o gateway em Go entrar.
+- **O gateway e o núcleo ainda não se falam.** O gateway em Go aceita
+  WebSocket de verdade e está medido, mas não cria `Mesh.Connection` do outro
+  lado: a ponte entre os dois é a próxima etapa. Até ela existir, são dois
+  resultados independentes, e o README não finge o contrário.
+- **As conexões do núcleo são simuladas.** Não há socket nos 700 mil: são
+  processos com estado, que é o que aquela medição quer isolar. O custo do
+  socket real está medido separadamente, no gateway.
+- **O gateway não valida máscara de cliente.** A RFC 6455 §5.3 exige que o
+  cliente mascare os quadros; o servidor aceita sem máscara. Há teste
+  registrando a lacuna em vez de deixá-la implícita.
+- **Sem ping/pong com prazo no gateway.** As conexões ficam ociosas de
+  propósito, que é o cenário de presença; um gateway de produção derrubaria
+  conexão morta por timeout.
 - **Contadores de observação são perdidos no reinício** do `Mesh.Stats`. É
   declarado, não um bug: preservá-los exigiria escrita em disco no caminho
   quente para proteger um número que serve ao operador.
@@ -382,8 +490,12 @@ etapa.
 
 1. ~~**Fanout particionado**~~ **Feito.** ~3x medido, três implementações
    comparadas, custo de memória estabelecido em +7% por conexão.
-2. **Gateway em Go** com WebSocket real, medindo quanto um socket de verdade
-   custa por conexão em relação aos 3,5 KB do processo puro.
+2. ~~**Gateway em Go** com WebSocket real~~ **Feito.** ~7,1 KB por conexão
+   contra 3,8 KB do processo BEAM, e o efeito do tamanho dos buffers medido.
+3. **A ponte gateway ↔ núcleo**, para que um WebSocket real crie um
+   `Mesh.Connection` do outro lado.
+4. **Buffers de kernel por socket**, via `/proc/net/sockstat`, para fechar a
+   conta de memória de uma conexão real.
 3. **Supervisão em Erlang puro** do mesmo núcleo, para a comparação que o
    projeto promete: a mesma árvore em Elixir e em Erlang, lado a lado.
 4. **Serviço em Gleam** na mesma BEAM, para mostrar tipagem estática sobre o
@@ -408,6 +520,18 @@ etapa.
   devolvia medição não convergida em silêncio, como o do P01. Saber que um
   modo de falha existe não impede de reintroduzi-lo — o que impede é a
   ferramenta reclamar.
+- **Um socket real custa menos do que eu esperava: 1,9x um processo BEAM.** O
+  folclore diz "milhares contra milhões"; medido, a diferença entre uma
+  goroutine com socket e um processo sem socket é 7,1 KB contra 3,8 KB. O que
+  separa as duas plataformas em escala não é o custo por conexão — é
+  supervisão, isolamento de falha e o que acontece quando um deles morre.
+- **Escrever a camada de protocolo pagou pela medição.** Buffer de 1 KiB em vez
+  dos 4 KiB herdados economiza 35 % por conexão. Com uma biblioteca, esse
+  número não existiria, porque a escolha não teria sido minha.
+- **O instrumento tem viés, e o viés aparece como anomalia.** O degrau de
+  16 KiB saiu abaixo do de 4 KiB porque RSS conta só páginas tocadas: buffer
+  grande e ocioso é invisível. Uma anomalia implausível na tabela é informação
+  sobre a métrica, não sujeira para arredondar.
 - **A biblioteca padrão já tinha a resposta.** Eu estava reimplementando
   serialmente um fanout que o `Registry.dispatch/4` faz particionado desde
   sempre. Antes de otimizar, vale ler o que a plataforma oferece — e a BEAM
@@ -444,7 +568,9 @@ etapa.
 | Benchmark de capacidade | ✅ 700 mil conexões, 3.783 bytes cada |
 | Benchmark de difusão, 3 implementações | ✅ intercalado, com dispersão reportada |
 | Fanout particionado | ✅ ~3x medido; +7% de memória por conexão |
-| Gateway em Go, WebSocket real | ⬜ |
+| Gateway em Go, WebSocket real | ✅ zero dependências, 7 testes, ~7,1 KB/conn |
+| Efeito do tamanho dos buffers | ✅ +35 % com o padrão das bibliotecas |
+| Ponte gateway ↔ núcleo | ⬜ |
 | Erlang, Gleam, Rust, Scala, Clojure | ⬜ ambiente pronto, não integrados |
 | Distribuição entre nós | ⬜ |
 | NATS, OpenTofu, kind em uso | ⬜ instalados e verificados, não integrados |

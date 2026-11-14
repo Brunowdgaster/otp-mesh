@@ -9,3 +9,7 @@ target/
 .terraform.lock.hcl
 terraform.tfstate*
 *.tfstate.backup
+
+# Go
+go/gateway
+go/loadgen

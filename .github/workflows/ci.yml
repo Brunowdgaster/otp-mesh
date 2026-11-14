@@ -36,6 +36,41 @@ jobs:
           sed 's/^degraus = .*/degraus = [1_000, 10_000]/' bench/capacity.exs > /tmp/short.exs
           mix run /tmp/short.exs
 
+  go:
+    runs-on: ubuntu-latest
+    name: gateway em Go
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          # Sem cache de modulos: o projeto nao tem dependencia nenhuma.
+          cache: false
+      - name: formatacao
+        working-directory: go
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: vet
+        working-directory: go
+        run: go vet ./...
+      - name: testes do WebSocket
+        working-directory: go
+        run: go test -race ./...
+      - name: compila os dois binarios
+        working-directory: go
+        run: |
+          go build ./cmd/gateway
+          go build ./cmd/loadgen
+      # O benchmark de conexoes NAO entra: ele mexe em sysctl e depende de
+      # limites de kernel do runner. Em vez disso, uma rampa minima que prova
+      # que gateway e loadgen conversam de verdade.
+      - name: gateway e loadgen conversam
+        working-directory: go
+        run: |
+          go run ./cmd/gateway -addr 127.0.0.1:8099 -quiet &
+          sleep 2
+          go run ./cmd/loadgen -addr 127.0.0.1:8099 -n 200 -hold 2s
+          curl -fsS http://127.0.0.1:8099/stats
+
   ambiente:
     runs-on: ubuntu-latest
     name: teste de fumaca do ambiente
