@@ -80,7 +80,12 @@ jobs:
         with:
           otp-version: '27'
           # O Gleam compila para Erlang e usa rebar3 para a stdlib.
-          gleam-version: '1.9'
+          #
+          # A versao tem de bater com a travada em manifest.toml: o
+          # gleam_stdlib 1.0.5 declara `gleam >= 1.14`, e com 1.9 no runner o
+          # `gleam test` falhava com "Incompatible Gleam version". Lockfile
+          # commitado nao protege de toolchain velha -- protege do contrario.
+          gleam-version: '1.19'
           rebar3-version: '3'
       - name: formatacao
         working-directory: gleam/mesh_codec
