@@ -35,6 +35,44 @@ defmodule Mesh do
   end
 
   @doc """
+  Abre uma conexão implementada em **Erlang puro** (`mesh_conn`).
+
+  Mesma árvore de supervisão, mesmo `Registry`, mesmo tópico de difusão — o
+  `Mesh.broadcast/1` alcança as duas implementações sem saber qual é qual,
+  porque as duas tratam o mesmo `{:deliver, payload}` e compilam para o mesmo
+  bytecode da BEAM.
+
+  Não há camada de tradução, adaptador nem porta. É o que significa dizer que
+  Elixir e Erlang são a mesma plataforma, e não duas que interoperam.
+  """
+  def open_erlang(id) do
+    DynamicSupervisor.start_child(Mesh.ConnSupervisor, :mesh_conn.child_spec(id))
+  end
+
+  @doc """
+  Abre `n` conexões em Erlang, numeradas de `from` em diante.
+  """
+  def open_many_erlang(n, from \\ 0) do
+    Enum.reduce(from..(from + n - 1), {0, 0}, fn id, {ok, err} ->
+      case open_erlang(id) do
+        {:ok, _pid} -> {ok + 1, err}
+        _ -> {ok, err + 1}
+      end
+    end)
+  end
+
+  @doc """
+  Lê os contadores de uma conexão, seja ela Elixir ou Erlang.
+
+  As duas respondem `:stats` com um mapa que tem `:received` e `:dropped`; a
+  versão em Erlang acrescenta `impl: :erlang`, que é como o teste distingue sem
+  olhar o pid.
+  """
+  def stats_de(id), do: GenServer.call(via(id), :stats)
+
+  defp via(id), do: {:via, Registry, {Mesh.Registry, id}}
+
+  @doc """
   Fecha uma conexão e **espera** o `Registry` refletir o fechamento.
 
   ## Por que a espera existe

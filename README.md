@@ -32,9 +32,9 @@ conexões      abrir (ms)   BEAM (MB)  bytes/conn  broadcast (ms)
 
 > **Status:** o **núcleo em Elixir/OTP, o gateway em Go e a ponte entre os
 > dois** estão completos e medidos — 500 WebSockets reais viram 500 processos
-> supervisionados, verificado por teste de integração no CI. As outras cinco
-> linguagens previstas no plano (Erlang, Gleam, Rust, Scala, Clojure) e o HCL
-> ainda não foram integradas; o ambiente delas está instalado e verificado, ver
+> supervisionados, verificado por teste de integração no CI. As outras quatro
+> linguagens previstas no plano (Gleam, Rust, Scala, Clojure) e o HCL ainda
+> não foram integradas; o ambiente delas está instalado e verificado, ver
 > [Estado atual](#estado-atual).
 
 ## Objetivo
@@ -188,6 +188,58 @@ número.
 
 *Lição, de novo:* o instrumento de medição precisa ser verificado como o
 sistema. `:erlang.memory/1` é correto; chamá-lo no lugar errado não é.
+
+### Erlang: a mesma conexão, no mesmo nó, com um byte de diferença
+
+`mix` compila `src/*.erl` no mesmo app. Isso não é conveniência — é a
+demonstração: `mesh_conn.erl` é uma implementação alternativa de conexão que
+vive na **mesma árvore de supervisão**, usa o **mesmo `Registry`** e recebe a
+**mesma difusão** que as conexões em Elixir.
+
+Não há adaptador, porta nem camada de tradução. `Mesh.broadcast/1` faz `cast`
+de `{:deliver, payload}` para o que estiver no tópico, e o módulo Erlang trata
+`{deliver, Payload}` — o mesmo átomo, o mesmo bytecode.
+
+Medido no mesmo nó, alternando as duas, melhor de 5:
+
+| conexões | abrir ex | abrir erl | **bytes ex** | **bytes erl** | difusão ex | difusão erl |
+|---|---|---|---|---|---|---|
+| 10.000 | 206,9 ms | 236,8 ms | **3.304** | **3.305** | 27,8 ms | 15,2 ms |
+| 50.000 | 975,9 ms | 938,2 ms | 3.499 | 3.305 | 49,0 ms | 52,5 ms |
+| 100.000 | 2.693 ms | 2.517 ms | 3.547 | 3.338 | 193,1 ms | 99,9 ms |
+
+**Um byte de diferença em 10 mil conexões.** E isso *é* o resultado, não a
+ausência dele: confirma que Elixir e Erlang não são duas plataformas que
+interoperam — são a mesma, e a escolha entre elas é de **ergonomia**, não de
+desempenho.
+
+Nos degraus maiores o Erlang aparece ~6 % abaixo em memória (3.338 contra
+3.547), o que seria consistente com a camada fina que o `GenServer` do Elixir
+acrescenta sobre o `gen_server` do Erlang. Mas 6 % com esta dispersão **não
+está estabelecido** — e os tempos de abertura e difusão alternam de vencedor
+sem padrão, que é o que se espera de ruído.
+
+O caos vale para as duas: matar 30 % de 20 mil conexões Erlang converge e
+deixa o supervisor intacto, exatamente como na versão em Elixir. `temporary` é
+`temporary` nas duas linguagens.
+
+#### O bug que custou cinco testes: módulo não é nome
+
+```erlang
+%% errado
+via(Id) -> {via, 'Elixir.Mesh.Registry', {'Elixir.Mesh.Registry', Id}}.
+%% certo
+via(Id) -> {via, 'Elixir.Registry', {'Elixir.Mesh.Registry', Id}}.
+```
+
+No `{via, Modulo, Nome}`, o **módulo** é quem implementa o comportamento de
+registro — `Registry` — e o **nome** é a instância — `Mesh.Registry`.
+Conflatá-los dá `undef: Mesh.Registry.whereis_name/1`, porque `Mesh.Registry`
+não é módulo: é só um átomo usado como nome de processo.
+
+O erro é fácil em Elixir, onde os dois aparecem com a mesma cara. Em Erlang,
+com o prefixo `'Elixir.'` explícito, a distinção fica visível — e foi
+escrevendo a versão Erlang que ela ficou óbvia.
 
 ### O gateway em Go: quanto custa um socket de verdade
 
@@ -364,6 +416,7 @@ cd elixir/mesh
 mix test                       # 8 testes: ciclo de vida, caos, contrapressão
 mix run bench/capacity.exs     # a rampa até 700 mil + caos + extrapolação
 mix run bench/fanout.exs       # as três difusões, intercaladas
+mix run bench/erlang_vs_elixir.exs   # a mesma conexão nas duas linguagens
 
 cd ../../go && go test ./...   # 7 testes do WebSocket, zero dependências
 cd .. && bash bench/gateway.sh # custo de uma conexão real + efeito dos buffers
@@ -417,6 +470,7 @@ Três decisões estruturais:
 |---|---|---|---|
 | **Go 1.26** | gateway WebSocket, gerador de carga | Uma goroutine por conexão é o par natural de um processo por conexão, e o `net/http` com `Hijacker` dá o socket cru sem intermediário. É também a comparação que o projeto quer: a plataforma onde "um por conexão" é barato **sem** supervisão nem isolamento de falha | **Node.js**: um laço de eventos, não um por conexão — mediria outra coisa. **Rust**: mais rápido e sem GC, mas `async` exige escolher runtime, e aí a medição seria do Tokio |
 | **`ws/` escrito à mão** (zero dependências) | aperto de mão e quadros da RFC 6455 | O custo por conexão é dominado pelos buffers, e em biblioteca eles são escolha dela. Com `ws.Config` explícito, a tabela de efeito dos buffers existe — e ela mostra +35 % para o padrão herdado | **gorilla/websocket**, **coder/websocket**: ambas boas e livres; esconderiam justamente a variável sob medição |
+| **Erlang/OTP 27** | `src/mesh_conn.erl`, conexão alternativa no mesmo nó | É a prova de que Elixir e Erlang são a mesma plataforma: o `mix` compila `src/*.erl` no mesmo app, e a conexão Erlang entra na mesma árvore, no mesmo `Registry`, recebendo a mesma difusão. Escrever a versão em Erlang também expôs um bug que o Elixir escondia — `{via, Modulo, Nome}` com módulo e nome conflatados | **Repositório separado com nó distribuído**: mostraria interoperação entre nós, que é outra coisa — e esconderia justamente o fato de ser um nó só |
 | **Elixir / OTP 27** | o núcleo inteiro | A BEAM é a única plataforma mainstream em que um processo por conexão é a escolha *óbvia* e não um truque: processo de centenas de bytes, escalonador preemptivo por redução, e supervisão como parte da linguagem e não biblioteca. Medir 700 mil processos supervisionados em 2,3 GB não é possível em runtime de threads do SO | **Go**: goroutines são baratas, mas não há supervisão nem isolamento de falha — um `panic` não contido derruba o processo todo. Go entra no gateway HTTP, onde é melhor |
 | **`Registry` particionado** | nomeação das conexões | Nomeação distribuída sem processo central: cada partição é uma tabela ETS, e o `Registry` monitora os processos para limpar sozinho quando morrem. É o que faz a convergência pós-caos ser automática | **GenServer com um `Map`**: um processo central vira gargalo e ponto único de falha, e perderia o estado ao reiniciar |
 | **`DynamicSupervisor`** | ciclo de vida das conexões | Filhos criados em tempo de execução, sem lista estática. Suporta `:temporary`, que é o que evita a tempestade de reinícios | **`Supervisor` com lista estática**: não serve, as conexões não são conhecidas de antemão |
@@ -531,9 +585,9 @@ etapa.
 
 ## Limites conhecidos
 
-- **Só o núcleo em Elixir existe.** Erlang, Gleam, Go, Rust, Scala, Clojure,
-  HCL e YAML estão no plano do projeto e **não** foram integrados. O ambiente
-  deles está instalado e verificado, o que é diferente de estar em uso.
+- **Gleam, Rust, Scala, Clojure e HCL** estão no plano do projeto e **não**
+  foram integrados. O ambiente deles está instalado e verificado, o que é
+  diferente de estar em uso.
 - **Nó único.** Não há distribuição BEAM, nem particionamento entre nós, nem
   `Horde`/`libcluster`. Toda a medição é de um processo `beam.smp`.
 - **A difusão melhorou ~3x mas segue não escalando de graça.** 142 ms para
@@ -575,8 +629,8 @@ etapa.
    que reinicia.
 5. **Buffers de kernel por socket**, via `/proc/net/sockstat`, para fechar a
    conta de memória de uma conexão real.
-3. **Supervisão em Erlang puro** do mesmo núcleo, para a comparação que o
-   projeto promete: a mesma árvore em Elixir e em Erlang, lado a lado.
+3. ~~**Supervisão em Erlang puro**~~ **Feito.** `mesh_conn.erl` no mesmo nó,
+   com benchmark comparativo: um byte de diferença por conexão.
 4. **Serviço em Gleam** na mesma BEAM, para mostrar tipagem estática sobre o
    mesmo runtime.
 5. **Caminho crítico em Rust** via NIF, medindo o custo da travessia.
@@ -599,6 +653,14 @@ etapa.
   devolvia medição não convergida em silêncio, como o do P01. Saber que um
   modo de falha existe não impede de reintroduzi-lo — o que impede é a
   ferramenta reclamar.
+- **Elixir e Erlang são a mesma plataforma, e agora tenho o número.** 3.304
+  contra 3.305 bytes por conexão. A escolha entre as duas é ergonomia, e quem
+  disser que uma é mais rápida que a outra para o mesmo algoritmo precisa
+  mostrar a medição.
+- **Escrever em Erlang expôs um bug que o Elixir escondia.** O `{via, Modulo,
+  Nome}` com módulo e nome conflatados passa desapercebido em Elixir, onde
+  `Registry` e `Mesh.Registry` têm a mesma cara. Com o prefixo `'Elixir.'`
+  explícito, o erro fica visível.
 - **`handle_continue` não é lugar de laço.** Enquanto um GenServer processa
   continuações, ele não atende chamadas — e o sintoma apareceu longe da causa:
   sete testes com timeout, nenhum deles sobre aceitação de conexão. Quem
@@ -647,7 +709,7 @@ etapa.
 | Conexão como processo, com contrapressão | ✅ |
 | Caos: matar fração das conexões | ✅ supervisor sobrevive, convergência medida |
 | Caos: matar processo `:permanent` | ✅ reinício em 5,83 ms, estado reconstruído |
-| Suíte ExUnit | ✅ 17/17, estável em 15 execuções seguidas |
+| Suíte ExUnit | ✅ 22/22, estável em 15 execuções seguidas |
 | Benchmark de capacidade | ✅ 700 mil conexões, 3.783 bytes cada |
 | Benchmark de difusão, 3 implementações | ✅ intercalado, com dispersão reportada |
 | Fanout particionado | ✅ ~3x medido; +7% de memória por conexão |
@@ -655,7 +717,8 @@ etapa.
 | Efeito do tamanho dos buffers | ✅ +35 % com o padrão das bibliotecas |
 | Ponte gateway ↔ núcleo | ✅ TCP `packet: 4`, 7 testes + integração no CI |
 | Teste de integração entre as linguagens | ✅ 500 WebSockets → 500 processos |
-| Erlang, Gleam, Rust, Scala, Clojure | ⬜ ambiente pronto, não integrados |
+| **Erlang** no mesmo nó | ✅ `mesh_conn.erl`, 5 testes, benchmark comparativo |
+| Gleam, Rust, Scala, Clojure | ⬜ ambiente pronto, não integrados |
 | Distribuição entre nós | ⬜ |
 | NATS, OpenTofu, kind em uso | ⬜ instalados e verificados, não integrados |
 | CI | ⬜ |
