@@ -254,6 +254,27 @@ morte em massa.
 *Lição:* teste instável é sintoma, e o primeiro palpite deve ser que o sistema
 está errado — não o teste. Dois dos três bugs deste projeto apareceram assim.
 
+### O terceiro caso de falha silenciosa, achado pelo CI
+
+O `setup.sh` rodava `apt-get install -y -qq ... >/dev/null` **sem `apt-get
+update` antes e sem checar o código de saída**. Numa máquina com as listas de
+pacotes vazias — um runner de CI recém-criado — o install falha com "Unable to
+locate package", o script imprime "instalando: ..." e segue como se tivesse
+dado certo.
+
+O primeiro CI deste repositório passou no passo de provisionamento e falhou no
+teste de fumaça com `elixir: command not found`. O provisionador mentiu; o
+verificador pegou.
+
+É o **terceiro** caso do mesmo padrão neste portfólio: o harness de benchmark
+do P01, o `kill_fraction` deste projeto e agora o provisionador. A forma é
+sempre idêntica — redirecionar a saída e não olhar o código de retorno. Hoje o
+script roda `update`, falha com mensagem, e **confere com `dpkg` o que de fato
+ficou instalado** em vez de confiar no instalador.
+
+É também a defesa do teste de fumaça existir: um `setup.sh` que se auto-declara
+bem-sucedido não é verificação.
+
 ### Por que o benchmark para em 2 GB
 
 Não é timidez: é que o OOM killer do Linux, acionado por um benchmark, não mata
@@ -322,6 +343,10 @@ etapa.
   devolvia medição não convergida em silêncio, como o do P01. Saber que um
   modo de falha existe não impede de reintroduzi-lo — o que impede é a
   ferramenta reclamar.
+- **Três vezes o mesmo modo de falha, em três projetos.** Harness de benchmark,
+  injetor de caos e provisionador: todos redirecionavam a saída e ignoravam o
+  código de retorno. Conhecer um modo de falha não imuniza contra ele; o que
+  imuniza é a ferramenta reclamar alto.
 - **Teste instável é sintoma, não ruído.** A falha intermitente de ~2 em 12
   execuções era um bug de API: `close/1` retornava antes de o `Registry`
   convergir. Acrescentar um `sleep` no teste teria escondido o problema para

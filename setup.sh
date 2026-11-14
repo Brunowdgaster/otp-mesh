@@ -71,7 +71,40 @@ if [ -n "$MISSING" ]; then
         echo "  faltando:$MISSING"
     else
         echo "  instalando:$MISSING"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $MISSING >/dev/null
+
+        # `apt-get update` antes, e o erro NÃO é engolido.
+        #
+        # A primeira versão rodava `apt-get install -y -qq ... >/dev/null` sem
+        # update e sem checar o código de saída. Numa máquina com as listas de
+        # pacotes vazias — um runner de CI recém-criado, por exemplo — o
+        # install falha com "Unable to locate package", o script imprime
+        # "instalando: ..." e segue como se tivesse dado certo. Foi assim que o
+        # primeiro CI deste projeto passou no provisionamento e falhou no teste
+        # de fumaça com `elixir: command not found`.
+        #
+        # É o terceiro caso de falha silenciosa que este portfólio corrige: o
+        # harness do P01, o do P03 e agora o provisionador. O padrão é sempre o
+        # mesmo — redirecionar a saída e não olhar o código de retorno.
+        if ! apt-get update -qq; then
+            echo "  ERRO: apt-get update falhou" >&2
+            exit 1
+        fi
+
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $MISSING; then
+            echo "  ERRO: apt-get install falhou para:$MISSING" >&2
+            exit 1
+        fi
+
+        # Confere o que de fato ficou instalado, em vez de confiar no instalador.
+        ainda_falta=""
+        for p in $MISSING; do
+            dpkg -s "$p" >/dev/null 2>&1 || ainda_falta="$ainda_falta $p"
+        done
+        if [ -n "$ainda_falta" ]; then
+            echo "  ERRO: apt disse que instalou, mas falta:$ainda_falta" >&2
+            exit 1
+        fi
+        echo "  instalados e conferidos"
     fi
 else
     echo "  todos presentes"
