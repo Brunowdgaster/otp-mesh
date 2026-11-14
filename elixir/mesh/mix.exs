@@ -11,7 +11,6 @@ defmodule Mesh.MixProject do
     ]
   end
 
-  # Run "mix help compile.app" to learn about applications.
   def application do
     [
       extra_applications: [:logger],
@@ -19,11 +18,22 @@ defmodule Mesh.MixProject do
     ]
   end
 
-  # Run "mix help deps" to learn about dependencies.
+  # `rustler` é a única dependência do projeto, e é `runtime: false`: ele serve
+  # para compilar o NIF em Rust, não para executá-lo.
+  #
+  # Por que uma dependência aqui, depois de o resto do portfólio ter zero:
+  # escrever um NIF à mão contra a ABI do `erl_nif.h` é dezenas de linhas de
+  # `unsafe extern "C"` e conversão manual de termos. Isso não mediria "quanto
+  # custa cruzar para o nativo", mediria a qualidade do meu boilerplate.
+  # `rustler` é o que se usaria de verdade, então é com ele que o custo medido
+  # corresponde ao custo real.
+  #
+  # Ele acrescenta uma camada fina de codificação/decodificação de termos, e
+  # essa camada **faz parte** do que um projeto real paga — está declarado no
+  # README junto com o número.
   defp deps do
     [
-      # {:dep_from_hexpm, "~> 0.3.0"},
-      # {:dep_from_git, git: "https://github.com/elixir-lang/my_dep.git", tag: "0.1.0"}
+      {:rustler, "~> 0.36", runtime: false}
     ]
   end
 end

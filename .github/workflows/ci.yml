@@ -71,6 +71,40 @@ jobs:
           go run ./cmd/loadgen -addr 127.0.0.1:8099 -n 200 -hold 2s
           curl -fsS http://127.0.0.1:8099/stats
 
+  # O NIF em Rust e opcional no projeto, mas o CI o compila: e a unica forma de
+  # verificar que o codec em Rust segue conforme aos vetores compartilhados.
+  nif:
+    runs-on: ubuntu-latest
+    name: NIF em Rust
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          elixir-version: '1.18'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: dependencias
+        working-directory: elixir/mesh
+        run: mix deps.get
+      - name: compilar com o NIF
+        working-directory: elixir/mesh
+        env:
+          MESH_BUILD_NIF: '1'
+        run: mix compile --force --warnings-as-errors
+      - name: testes, incluindo os 9 do NIF
+        working-directory: elixir/mesh
+        env:
+          MESH_BUILD_NIF: '1'
+        run: mix test --force
+      # Rampa curta: o numero do benchmark depende da maquina, e runner
+      # compartilhado nao serve de linha de base. Aqui o objetivo e so provar
+      # que o benchmark executa.
+      - name: benchmark da travessia executa
+        working-directory: elixir/mesh
+        env:
+          MESH_BUILD_NIF: '1'
+        run: mix run bench/nif.exs
+
   gleam:
     runs-on: ubuntu-latest
     name: codec em Gleam

@@ -1,0 +1,17 @@
+[package]
+name = "mesh_nif"
+version = "0.1.0"
+edition = "2021"
+description = "Codec do protocolo da ponte como NIF, para medir o custo da travessia BEAM<->nativo"
+license = "MIT"
+
+[lib]
+name = "mesh_nif"
+# cdylib: a BEAM carrega o NIF como biblioteca compartilhada.
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.38"
+
+[profile.release]
+opt-level = 3

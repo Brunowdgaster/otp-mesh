@@ -33,7 +33,7 @@ conexões      abrir (ms)   BEAM (MB)  bytes/conn  broadcast (ms)
 > **Status:** o **núcleo em Elixir/OTP, o gateway em Go e a ponte entre os
 > dois** estão completos e medidos — 500 WebSockets reais viram 500 processos
 > supervisionados, verificado por teste de integração no CI. As outras quatro
-> linguagens previstas no plano (Rust, Scala, Clojure) e o HCL ainda não foram
+> linguagens previstas no plano (Scala, Clojure) e o HCL ainda não foram
 > integradas; o ambiente delas está instalado e verificado, ver
 > [Estado atual](#estado-atual).
 
@@ -243,12 +243,13 @@ escrevendo a versão Erlang que ela ficou óbvia.
 
 ### Gleam: o mesmo protocolo, com os erros movidos para o compilador
 
-O protocolo da ponte tem três implementações: Elixir (a fonte do formato), Go
-(o gateway) e **Gleam** — que existe para mostrar o que a tipagem estática
-sobre a BEAM muda na forma de escrever a mesma coisa.
+O protocolo da ponte tem quatro implementações: Elixir (a fonte do formato), Go
+(o gateway), Rust (a medição da travessia, abaixo) e **Gleam** — que existe para
+mostrar o que a tipagem estática sobre a BEAM muda na forma de escrever a mesma
+coisa.
 
-Nas duas primeiras, um quadro é um punhado de bytes com uma convenção na cabeça
-de quem escreveu. Em Gleam, é um tipo:
+Nas outras três, um quadro é um punhado de bytes com uma convenção na cabeça de
+quem escreveu. Em Gleam, é um tipo:
 
 ```gleam
 pub type Frame {
@@ -274,23 +275,32 @@ handler"* existe do lado Elixir **em tempo de execução**. Em Gleam, o
 compilador não deixa chamar `decode` sem lidar com o `Error`. É o mesmo bug,
 pego em dois momentos diferentes — e essa é a comparação que o projeto quer.
 
-### Um protocolo, três linguagens, os mesmos bytes
+### Um protocolo, quatro linguagens, os mesmos bytes
 
 O arquivo `protocolo/vetores.txt` tem 10 quadros em hexadecimal, gerados pelo
-Elixir. **As três implementações são verificadas contra ele:**
+Elixir. **As quatro implementações são verificadas contra ele:**
 
 | implementação | teste | o que verifica |
 |---|---|---|
 | Elixir | `test/protocolo_test.exs` | `frame/3` gera exatamente aqueles bytes |
 | Go | `bridge/bridge_test.go` | `Encode`/`Decode` conformes |
 | Gleam | `test/mesh_codec_test.gleam` | `encode`/`decode` conformes |
+| Rust (NIF) | `test/nif_test.exs` | `encode`/`decode` conformes, e **iguais ao Elixir chamada por chamada** |
+
+A quarta linha acrescenta uma verificação que as outras não podem fazer: como o
+NIF roda no mesmo processo, o teste compara as duas implementações **lado a
+lado, com os mesmos argumentos** — incluindo as fronteiras do campo de 64 bits
+(0 e 2⁶⁴−1), onde errar o sinal ou o tamanho na travessia daria um id diferente
+do enviado. O sintoma disso seria "conexão não encontrada" para um cliente que
+existe.
 
 Por que isso não é decorativo: **divergência de formato não dá exceção.** Um
 lado escrevendo o id em little-endian e o outro em big-endian produz conexões
 "não encontradas" para clientes que existem — um bug que aparece longe da
 causa, e que os testes de unidade de cada lado passariam sem notar.
 
-Os três testes começam verificando que **o arquivo foi lido e tem 10 linhas**.
+Os quatro testes começam verificando que **o arquivo foi lido e tem 10
+linhas**.
 Sem isso, um caminho errado faria os testes de conformidade iterarem sobre
 lista vazia e passarem vacuamente — o jeito mais fácil de um teste de
 conformidade não testar nada.
@@ -312,6 +322,144 @@ chamada de função.
 
 É o mesmo ponto que a conexão em Erlang faz do outro lado: três linguagens
 (Elixir, Erlang, Gleam) sobre um runtime, sem camada de tradução entre elas.
+
+E é o contraste exato com o NIF em Rust medido na seção seguinte: Gleam chamando
+OTP custa uma chamada de função, enquanto Rust chamando a BEAM custa **~30 ns de
+travessia**. "Rodar na mesma máquina virtual" e "ser chamável da máquina
+virtual" são coisas diferentes, e a diferença tem preço.
+
+### Rust via NIF: o conselho "escreve em Rust" medido
+
+"Se está lento, escreve em Rust" é conselho dado sem número. O custo de um NIF
+tem duas partes: a **travessia** (entrar no nativo, converter os termos, voltar)
+e o **trabalho**. Se a travessia custa mais do que o Rust economiza, o NIF
+perde.
+
+Medido com o codec do protocolo implementado nas duas linguagens, 9 repetições
+**alternadas** entre elas, mínimo de cada lado, **três execuções completas para
+confirmar reprodutibilidade**.
+
+#### A travessia, isolada
+
+Uma função que soma 1 — todo o tempo acima do equivalente em Elixir é custo de
+atravessar:
+
+| | ns por chamada | entre as 3 execuções |
+|---|---|---|
+| Elixir | 14,1 | 14,1 – 14,3 |
+| Rust (NIF) | 44,6 | 44,6 – 45,4 |
+| **custo da travessia** | **~30 ns** | 30,4 / 30,5 / 31,3 |
+
+Esse número reproduziu dentro de 3% em três execuções. É o resultado sólido
+daqui.
+
+#### O codec, variando o payload
+
+A coluna `veredito` só se pronuncia quando a diferença **supera a dispersão
+medida**. Quando não supera, ela diz `no ruído` — e isso é uma resposta, não uma
+falha:
+
+| payload | razão (Elixir/Rust) | veredito nas 3 execuções |
+|---|---|---|
+| vazio | 0,14 – 0,16x | Elixir (2 de 3; 1 no ruído) |
+| 16 B | 0,15 – 0,18x | **Elixir, nas 3** |
+| 64 B | 0,68 – 0,72x | **Elixir, nas 3** |
+| 256 B | 0,66 – 0,69x | Elixir (2 de 3) |
+| 1 KiB | 0,72 – 0,76x | Elixir (2 de 3) |
+| 4 KiB | 0,71 – 0,73x | **Elixir, nas 3** |
+| 16 KiB | 0,83 – 0,85x | Elixir (1 de 3), resto no ruído |
+| 64 KiB | 0,93 – 0,99x | **no ruído, nas 3** |
+| 256 KiB | 0,99 – 1,01x | **no ruído, nas 3** |
+| 1 MiB | 0,93 – 0,94x | **no ruído, nas 3** |
+
+Duas conclusões, com escopos diferentes:
+
+**Até 4 KiB, o Elixir ganha e isso está estabelecido.** A razão fica entre 0,14x
+e 0,76x, muito acima da dispersão. Em payload pequeno o NIF chega a ser **6x
+mais lento**, porque a travessia é tudo o que existe.
+
+**De 64 KiB para cima, não determinado.** A razão converge para ~0,95x e a
+diferença cai **dentro do ruído desta máquina**. Dizer "Elixir ganha em 1 MiB"
+seria inventar: as duas fazem o mesmo `memcpy` e a diferença deixa de ser
+distinguível.
+
+**O Rust não venceu acima do ruído em nenhum tamanho medido** — mas isso é
+afirmação sobre esta carga, não sobre a linguagem.
+
+#### Por que não ganha, mesmo em 1 MiB
+
+Construir um binário concatenando três campos é **uma instrução da máquina
+virtual**. A BEAM faz isso sem sair do runtime, e não há nada para o nativo
+otimizar — só travessia a pagar. Em payload grande as duas implementações fazem
+literalmente a mesma coisa, copiar bytes, e o Rust paga a travessia por cima.
+
+O número para decidir: **~30 ns de travessia por chamada**, e ~200 ns quando a
+chamada passa e devolve binários (conversão de termo mais alocação no heap de
+binários da BEAM). **Qualquer função que faça menos trabalho que isso fica mais
+lenta em Rust.**
+
+NIF compensa quando o trabalho é *algoritmicamente* mais barato em nativo —
+compressão, criptografia, parsing com SIMD — não quando é movimentação de dados.
+
+#### A medição errou primeiro, do jeito que eu já sabia
+
+A primeira versão deste benchmark media as 7 repetições do Elixir e **depois**
+as 7 do Rust. Duas execuções seguidas deram conclusões **opostas**:
+
+| execução | conclusão | travessia |
+|---|---|---|
+| 1 | "nenhum ponto de cruzamento" | 30,4 ns |
+| 2 | "ponto de cruzamento em 64 B" | 66,5 ns |
+
+É exatamente o erro que o [p01-metal-vm](https://github.com/Brunowdgaster/metal-vm)
+documenta: medir A em bloco e B em bloco atribui a B qualquer deriva de
+frequência que ocorra no meio. **Sexta vez** que a mesma classe de erro de
+instrumentação aparece neste portfólio.
+
+A correção tem quatro partes, e as quatro importaram:
+
+1. **alternar A e B a cada repetição**, para que a deriva atinja os dois;
+2. **reportar a dispersão** ao lado de cada número — a coluna mostra picos de
+   120% a 240% nesta máquina, que ficavam invisíveis atrás do mínimo;
+3. **aquecer** antes de medir e coletar lixo entre repetições, porque os
+   binários produzidos são lixo e a coleta deles caía na medição seguinte;
+4. **recusar-se a concluir** quando a margem não supera a dispersão. Um
+   benchmark que sempre conclui algo é um benchmark que mente em máquina
+   ruidosa.
+
+Depois disso, as três execuções deram o mesmo veredito nas dez linhas.
+
+#### A regra que não aparece em benchmark
+
+Um NIF roda **no escalonador da BEAM**, não numa thread à parte. Bloquear por
+mais de ~1 ms impede a preempção e destrói a latência de **todo o nó** — é o
+jeito mais rápido de jogar fora as propriedades de tempo real da plataforma.
+
+As funções aqui retornam em nanossegundos. Trabalho longo exigiria *dirty
+schedulers* (`schedule = "DirtyCpu"`), e esta implementação deliberadamente não
+os usa porque não precisa — está anotado no `lib.rs` para que ninguém copie o
+código para um caso onde precisaria.
+
+#### Compilação opcional, e duas armadilhas do mix
+
+O NIF só compila com `MESH_BUILD_NIF=1`; sem isso, `Mesh.Nif` é um esqueleto e
+`Mesh.Codec` usa a implementação em Elixir. O núcleo é o produto do projeto, o
+NIF é uma medição — exigir `cargo` de quem roda `mix test` seria cobrar por algo
+que a maioria não usa. Sem o NIF a suíte informa **"9 excluded"** em vez de
+passar como se tivesse verificado algo.
+
+**`use Rustler, skip_compilation?: true` ainda gera o `@on_load`.** Ele evita
+chamar o `cargo`, mas o módulo continua tentando carregar o `.so` — que não
+existe — e o aviso resultante derruba o `--warnings-as-errors` do CI. A solução
+foi definir o módulo condicionalmente: sem a variável, não há `@on_load` para
+falhar.
+
+**`System.get_env` em tempo de compilação não é rastreado pelo mix.** Alternar a
+variável não invalida o `.beam`, então `MESH_BUILD_NIF=1 mix compile` não
+recompila nada e a função levanta `:nif_not_loaded` *com a variável definida*.
+Tentei `Application.compile_env/3`, que o mix rastreia — e é pior: a validação
+roda **antes** da compilação e **aborta** exigindo recompilação manual, em vez de
+fazê-la. Ficou o `--force` explícito, documentado em "Como rodar".
 
 ### O gateway em Go: quanto custa um socket de verdade
 
@@ -495,6 +643,12 @@ cd .. && bash bench/gateway.sh # custo de uma conexão real + efeito dos buffers
 bash tests/integracao.sh       # Go <-> Elixir de ponta a ponta
 
 cd gleam/mesh_codec && gleam test  # codec tipado, contra os mesmos vetores
+
+# O NIF em Rust e opcional. O --force e necessario: System.get_env em tempo de
+# compilacao nao e rastreado pelo mix (ver lib/mesh/nif.ex).
+cd ../../elixir/mesh
+MESH_BUILD_NIF=1 mix test --force       # inclui os 9 testes do NIF
+MESH_BUILD_NIF=1 mix run bench/nif.exs  # custo da travessia BEAM<->Rust
 ```
 
 O benchmark para sozinho ao passar de 2 GB no BEAM. O limite é deliberado:
@@ -544,6 +698,7 @@ Três decisões estruturais:
 |---|---|---|---|
 | **Go 1.26** | gateway WebSocket, gerador de carga | Uma goroutine por conexão é o par natural de um processo por conexão, e o `net/http` com `Hijacker` dá o socket cru sem intermediário. É também a comparação que o projeto quer: a plataforma onde "um por conexão" é barato **sem** supervisão nem isolamento de falha | **Node.js**: um laço de eventos, não um por conexão — mediria outra coisa. **Rust**: mais rápido e sem GC, mas `async` exige escolher runtime, e aí a medição seria do Tokio |
 | **`ws/` escrito à mão** (zero dependências) | aperto de mão e quadros da RFC 6455 | O custo por conexão é dominado pelos buffers, e em biblioteca eles são escolha dela. Com `ws.Config` explícito, a tabela de efeito dos buffers existe — e ela mostra +35 % para o padrão herdado | **gorilla/websocket**, **coder/websocket**: ambas boas e livres; esconderiam justamente a variável sob medição |
+| **Rust 1.93 + rustler** | `native/mesh_nif`, codec como NIF | Existe para **medir o custo da travessia** BEAM↔nativo, que é a decisão que todo projeto BEAM enfrenta e quase ninguém mede. Resultado: ~30 ns por chamada, e o NIF não venceu acima do ruído em nenhum tamanho até 1 MiB | **NIF à mão contra a ABI do `erl_nif.h`**: dezenas de linhas de `unsafe extern "C"` e conversão manual de termos — mediria a qualidade do meu boilerplate, não o custo real. `rustler` é o que se usaria de verdade |
 | **Gleam 1.19** | `gleam/mesh_codec`, terceira implementação do protocolo | Tipagem estática sobre a BEAM: o quadro deixa de ser convenção e passa a ser tipo, e três classes de erro migram de tempo de execução para tempo de compilação. O `@external` para `file:read_file/1` mostra que chamar OTP de Gleam é chamada de função, não FFI | **`simplifile`** para o I/O: traria dependência e esconderia justamente o ponto de que Gleam é BEAM |
 | **Erlang/OTP 27** | `src/mesh_conn.erl`, conexão alternativa no mesmo nó | É a prova de que Elixir e Erlang são a mesma plataforma: o `mix` compila `src/*.erl` no mesmo app, e a conexão Erlang entra na mesma árvore, no mesmo `Registry`, recebendo a mesma difusão. Escrever a versão em Erlang também expôs um bug que o Elixir escondia — `{via, Modulo, Nome}` com módulo e nome conflatados | **Repositório separado com nó distribuído**: mostraria interoperação entre nós, que é outra coisa — e esconderia justamente o fato de ser um nó só |
 | **Elixir / OTP 27** | o núcleo inteiro | A BEAM é a única plataforma mainstream em que um processo por conexão é a escolha *óbvia* e não um truque: processo de centenas de bytes, escalonador preemptivo por redução, e supervisão como parte da linguagem e não biblioteca. Medir 700 mil processos supervisionados em 2,3 GB não é possível em runtime de threads do SO | **Go**: goroutines são baratas, mas não há supervisão nem isolamento de falha — um `panic` não contido derruba o processo todo. Go entra no gateway HTTP, onde é melhor |
@@ -708,7 +863,9 @@ etapa.
    com benchmark comparativo: um byte de diferença por conexão.
 4. ~~**Serviço em Gleam** na mesma BEAM~~ **Feito.** Codec tipado do
    protocolo, verificado contra os mesmos vetores de bytes do Elixir e do Go.
-5. **Caminho crítico em Rust** via NIF, medindo o custo da travessia.
+5. ~~**Caminho crítico em Rust** via NIF~~ **Feito.** Travessia medida em
+   ~30 ns por chamada; o Elixir ganha até 4 KiB e acima de 64 KiB a diferença
+   cai dentro do ruído.
 6. **Distribuição** com dois nós BEAM e `Registry` global.
 7. **NATS** como barramento entre nós.
 8. **OpenTofu + kind**: o cluster e os serviços provisionados por HCL, com
@@ -728,10 +885,21 @@ etapa.
   devolvia medição não convergida em silêncio, como o do P01. Saber que um
   modo de falha existe não impede de reintroduzi-lo — o que impede é a
   ferramenta reclamar.
+- **"Escreve em Rust que fica mais rápido" é folclore, e agora tenho o
+  número.** A travessia custa **~30 ns por chamada** (reproduzido em três
+  execuções, ±3%). Até 4 KiB o Elixir ganha de forma estabelecida — em payload
+  pequeno o NIF é 6x mais lento. Acima de 64 KiB a diferença cai dentro do
+  ruído. NIF compensa quando o trabalho é algoritmicamente mais barato em
+  nativo, não quando é movimentação de dados.
+- **Erro de instrumentação, sexta vez.** Medi todas as repetições do Elixir e
+  depois todas as do Rust — o erro que o P01 me ensinou — e duas execuções
+  deram conclusões opostas. Saber a lição não substitui aplicá-la: a correção
+  agora é **código** (alternar, reportar dispersão, aquecer, e recusar-se a
+  concluir quando a margem não supera o ruído), não disciplina.
 - **A tipagem estática move o erro de lugar, não o elimina.** As três classes
   de erro que o Gleam pega em compilação são as mesmas que o Elixir pega em
   teste. O que muda é quando você descobre — e quanto custa descobrir tarde.
-- **Um arquivo de vetores vale mais que três suítes isoladas.** Divergência de
+- **Um arquivo de vetores vale mais que quatro suítes isoladas.** Divergência de
   formato entre linguagens não dá exceção: dá comportamento errado silencioso.
   Dez linhas de hexadecimal compartilhadas resolvem o que nenhum teste de
   unidade pegaria.
@@ -791,7 +959,7 @@ etapa.
 | Conexão como processo, com contrapressão | ✅ |
 | Caos: matar fração das conexões | ✅ supervisor sobrevive, convergência medida |
 | Caos: matar processo `:permanent` | ✅ reinício em 5,83 ms, estado reconstruído |
-| Suíte ExUnit | ✅ 26/26, estável em 15 execuções seguidas |
+| Suíte ExUnit | ✅ 35/35 com o NIF, 26 + 9 excluídos sem ele |
 | Benchmark de capacidade | ✅ 700 mil conexões, 3.783 bytes cada |
 | Benchmark de difusão, 3 implementações | ✅ intercalado, com dispersão reportada |
 | Fanout particionado | ✅ ~3x medido; +7% de memória por conexão |
@@ -801,8 +969,9 @@ etapa.
 | Teste de integração entre as linguagens | ✅ 500 WebSockets → 500 processos |
 | **Erlang** no mesmo nó | ✅ `mesh_conn.erl`, 5 testes, benchmark comparativo |
 | **Gleam** — codec tipado do protocolo | ✅ 13 testes, conformes aos vetores |
-| Protocolo verificado em 3 linguagens | ✅ Elixir, Go e Gleam contra `protocolo/vetores.txt` |
-| Rust, Scala, Clojure | ⬜ ambiente pronto, não integrados |
+| **Rust** — codec como NIF | ✅ 9 testes, travessia em ~30 ns (3 execuções, ±3%) |
+| Protocolo verificado em 4 linguagens | ✅ Elixir, Go, Gleam e Rust contra `protocolo/vetores.txt` |
+| Scala, Clojure | ⬜ ambiente pronto, não integrados |
 | Distribuição entre nós | ⬜ |
 | NATS, OpenTofu, kind em uso | ⬜ instalados e verificados, não integrados |
 | CI | ⬜ |

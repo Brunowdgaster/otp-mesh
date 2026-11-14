@@ -13,3 +13,7 @@ terraform.tfstate*
 # Go
 go/gateway
 go/loadgen
+
+# Rust NIF
+elixir/mesh/native/*/target/
+elixir/mesh/priv/native/

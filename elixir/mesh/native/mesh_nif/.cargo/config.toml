@@ -1,0 +1,4 @@
+# O NIF resolve simbolos da propria BEAM, que os fornece em tempo de carga.
+# Sem isto, o linker reclama de simbolos indefinidos (enif_*).
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,--allow-shlib-undefined"]
