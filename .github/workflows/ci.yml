@@ -185,6 +185,18 @@ jobs:
       - uses: opentofu/setup-opentofu@v1
         with:
           tofu_version: '1.13.9'
+          # tofu_wrapper: false E OBRIGATORIO AQUI.
+          #
+          # Por padrao a action instala um wrapper em volta do `tofu` para
+          # expor stdout/stderr como saidas da action -- e ele ENGOLE o codigo
+          # de saida. Toda a verificacao de desvio depende de
+          # `plan -detailed-exitcode` devolver 2, e com o wrapper ela recebia 0
+          # enquanto o TEXTO do plan dizia "will be created".
+          #
+          # Sintoma: as duas asseroes de desvio falharam no CI e passaram
+          # localmente, com a mesma configuracao e a mesma versao do provider.
+          # Setima vez neste portfolio que um harness esconde o proprio sinal.
+          tofu_wrapper: false
       - name: 20 asseroes sobre a infraestrutura declarada
         working-directory: infra
         run: bash verifica.sh

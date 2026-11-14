@@ -848,6 +848,30 @@ authentication signature from unknown issuer"*. É problema de assinatura no
 registro, não do código, e a série 4.x resolve. Está anotado no `main.tf` para
 quem tentar fixar numa 3.x.
 
+**O wrapper do CI engolia o código de saída de que tudo dependia.** As duas
+asserções de desvio **passaram localmente e falharam no CI**, com a mesma
+configuração e a mesma versão do provider. O `plan` devolvia **0** enquanto o
+próprio texto dele dizia *"will be created"*.
+
+A causa: `opentofu/setup-opentofu` instala por padrão um wrapper em volta do
+`tofu` para expor stdout como saída da action — e ele descarta o código de
+saída. A correção é `tofu_wrapper: false`.
+
+**Sétima vez** neste portfólio que um harness esconde o próprio sinal. Então a
+correção não foi só na configuração do CI: o `verifica.sh` agora **autotesta o
+instrumento** antes de usá-lo (com tudo convergido, o código *tem* de ser 0) e
+compara **duas evidências** — o código de saída e o texto do plan. Quando elas
+discordam, ele não diz "nenhum desvio": diz
+
+```
+[FALHA] INSTRUMENTO QUEBRADO -- o texto do plan diz que há mudança,
+        mas o código de saída foi 0
+        Causa provável: wrapper em volta do tofu engolindo o exit code.
+```
+
+A diferença importa: "nenhum desvio detectado" é um falso OK, e falso OK é pior
+que falha.
+
 **O estado não vai para o repositório.** `.tfstate` está no `.gitignore` porque
 ele mapeia configuração a recursos reais. Aqui é local e descartável; num
 projeto de verdade vai para backend remoto com travamento — commitar o arquivo
@@ -1302,6 +1326,12 @@ etapa.
   devolvia medição não convergida em silêncio, como o do P01. Saber que um
   modo de falha existe não impede de reintroduzi-lo — o que impede é a
   ferramenta reclamar.
+- **Falso OK é pior que falha, e foi a sétima vez.** O wrapper do
+  `setup-opentofu` engolia o `exit code` de que toda a detecção de desvio
+  dependia: passava local, falhava no CI, e o modo de falhar era *silencioso* —
+  "nenhum desvio" em vez de "não sei". A correção virou autoteste do
+  instrumento mais confronto de duas evidências (código de saída **e** texto),
+  porque instrumento que mente precisa ser pego pelo próprio verificador.
 - **"O que isto acrescenta?" é uma pergunta melhor que "como se escreve
   isto?".** A seção do HCL não existe para mostrar sintaxe: existe porque
   `docker run` já funcionava, e a diferença tinha de ser demonstrada. Virou

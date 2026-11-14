@@ -170,6 +170,28 @@ fi
 # --------------------------------------------- 3. detecção de desvio
 cabecalho "3. Detecção de desvio: o que um script não tem"
 
+# AUTOTESTE DO INSTRUMENTO, antes de confiar nele.
+#
+# Toda esta secao depende de `plan -detailed-exitcode` devolver 2 quando ha
+# desvio. Se esse mecanismo nao funcionar, as asseroes abaixo passariam a
+# reportar "nenhum desvio" para qualquer coisa -- um falso OK, que e pior que
+# uma falha.
+#
+# O teste: com a infraestrutura convergida, o codigo TEM de ser 0. Combinado
+# com a verificacao de que o texto e o codigo concordam (avalia_desvio
+# abaixo), isso pega o wrapper que engole exit code.
+set +e
+tofu plan -no-color -input=false -detailed-exitcode >/dev/null 2>&1
+codigo_base=$?
+set -e
+
+if [ "$codigo_base" -eq 0 ]; then
+  ok "instrumento: plan -detailed-exitcode devolve 0 com tudo convergido"
+else
+  falha "instrumento: esperava 0 com tudo convergido, recebi $codigo_base"
+fi
+
+
 echo "  Quebrando a infraestrutura à mão, de dois jeitos."
 echo
 
@@ -182,12 +204,32 @@ tofu plan -no-color -input=false -detailed-exitcode >/tmp/v_plan_stop.txt 2>&1
 codigo=$?
 set -e
 
-if [ $codigo -eq 2 ] && grep -q "docker_container.gateway" /tmp/v_plan_stop.txt; then
-  ok "contêiner parado: plan devolveu 2 e apontou o recurso"
-  echo "          $(grep -E 'must be replaced|will be' /tmp/v_plan_stop.txt | head -1 | sed 's/^ *//')"
-else
-  falha "contêiner parado NÃO foi detectado (plan devolveu $codigo)"
-fi
+avalia_desvio() {
+  local arquivo="$1" codigo="$2" rotulo="$3"
+
+  # O texto do plan e o codigo de saida sao DUAS evidencias. Se elas
+  # discordarem, o problema nao e a infraestrutura: e o instrumento.
+  local texto_diz_mudanca=0
+  grep -qE "will be created|must be replaced|will be updated" "$arquivo" && texto_diz_mudanca=1
+
+  if [ "$codigo" -eq 2 ] && [ "$texto_diz_mudanca" -eq 1 ]; then
+    ok "$rotulo: plan devolveu 2 e o texto confirma"
+    echo "          $(grep -E 'must be replaced|will be created|will be updated' "$arquivo" | head -1 | sed 's/^ *//')"
+  elif [ "$codigo" -eq 0 ] && [ "$texto_diz_mudanca" -eq 1 ]; then
+    # Este e o caso que o CI expos: o wrapper da action
+    # opentofu/setup-opentofu engolia o codigo de saida.
+    falha "$rotulo: INSTRUMENTO QUEBRADO -- o texto do plan diz que ha mudanca, mas o codigo de saida foi 0"
+    echo "          Causa provavel: wrapper em volta do tofu engolindo o exit code."
+    echo "          Em GitHub Actions: 'tofu_wrapper: false' no setup-opentofu."
+  elif [ "$codigo" -eq 0 ]; then
+    falha "$rotulo: NAO foi detectado (plan devolveu 0 e o texto nao aponta mudanca)"
+  else
+    falha "$rotulo: plan devolveu $codigo"
+    tail -5 "$arquivo"
+  fi
+}
+
+avalia_desvio /tmp/v_plan_stop.txt "$codigo" "contêiner parado"
 
 # 3b. Contêiner removido. Caso mais grave, e o mais claro.
 docker rm -f "${PREFIXO}-gateway" >/dev/null
@@ -197,11 +239,7 @@ tofu plan -no-color -input=false -detailed-exitcode >/tmp/v_plan_rm.txt 2>&1
 codigo=$?
 set -e
 
-if [ $codigo -eq 2 ] && grep -q "will be created" /tmp/v_plan_rm.txt; then
-  ok "contêiner removido: plan devolveu 2 e dirá 'will be created'"
-else
-  falha "contêiner removido NÃO foi detectado (plan devolveu $codigo)"
-fi
+avalia_desvio /tmp/v_plan_rm.txt "$codigo" "contêiner removido"
 
 # 3c. E converge de volta.
 tofu apply -auto-approve -no-color -input=false >/tmp/v_apply3.txt 2>&1
