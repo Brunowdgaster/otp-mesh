@@ -41,8 +41,17 @@ jobs:
     name: teste de fumaca do ambiente
     steps:
       - uses: actions/checkout@v5
+      # O apt do runner traz um OTP mais antigo que o declarado pelo projeto, e
+      # o Gleam falha ao compilar a propria stdlib nele. Instalar o OTP 27
+      # primeiro faz o setup.sh pular erlang/elixir -- ele verifica a
+      # ferramenta, nao o pacote -- e o ambiente passa a bater com o declarado
+      # em docs/AMBIENTE.md.
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          elixir-version: '1.18'
       - name: provisionar
-        run: sudo bash setup.sh
+        run: sudo --preserve-env=PATH bash setup.sh
       # So o estagio das linguagens: 'infra' sobe um cluster kind, que no
       # runner duplicaria o que o job acima ja cobre a um custo bem maior.
       - name: smoke das linguagens

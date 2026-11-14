@@ -127,6 +127,21 @@ else
     echo "  todos presentes"
 fi
 
+# -------------------------------------------------- versao minima do Erlang
+# O Gleam compila a propria stdlib com rebar3/escript, e isso falha em OTP
+# antigo com um "syntax error" dentro de um escript temporario -- mensagem que
+# nao menciona versao nenhuma e custou uma rodada de CI para diagnosticar.
+# O projeto declara OTP 27; avisar aqui e mais util que falhar la.
+OTP_MIN=27
+if have erl; then
+    OTP=$(erl -noshell -eval 'io:fwrite(erlang:system_info(otp_release)),halt().' 2>/dev/null)
+    if [ -n "$OTP" ] && [ "$OTP" -lt "$OTP_MIN" ] 2>/dev/null; then
+        say "AVISO: Erlang/OTP $OTP, abaixo do minimo $OTP_MIN"
+        echo "  O Gleam falha ao compilar a stdlib em OTP anterior ao $OTP_MIN."
+        echo "  O resto do ambiente funciona; so o Gleam fica indisponivel."
+    fi
+fi
+
 # ------------------------------------------------------- binários de releases
 say "2. Binários de releases oficiais (GitHub, sem autenticação)"
 
