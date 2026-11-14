@@ -71,6 +71,24 @@ jobs:
           go run ./cmd/loadgen -addr 127.0.0.1:8099 -n 200 -hold 2s
           curl -fsS http://127.0.0.1:8099/stats
 
+  gleam:
+    runs-on: ubuntu-latest
+    name: codec em Gleam
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          # O Gleam compila para Erlang e usa rebar3 para a stdlib.
+          gleam-version: '1.9'
+          rebar3-version: '3'
+      - name: formatacao
+        working-directory: gleam/mesh_codec
+        run: gleam format --check src test
+      - name: testes do codec, contra os vetores compartilhados
+        working-directory: gleam/mesh_codec
+        run: gleam test
+
   # O teste que atravessa as duas linguagens. Testes de unidade dos dois lados
   # passariam mesmo com o protocolo divergindo: o enquadramento so e exercitado
   # de verdade quando os bytes atravessam.

@@ -33,8 +33,8 @@ conexões      abrir (ms)   BEAM (MB)  bytes/conn  broadcast (ms)
 > **Status:** o **núcleo em Elixir/OTP, o gateway em Go e a ponte entre os
 > dois** estão completos e medidos — 500 WebSockets reais viram 500 processos
 > supervisionados, verificado por teste de integração no CI. As outras quatro
-> linguagens previstas no plano (Gleam, Rust, Scala, Clojure) e o HCL ainda
-> não foram integradas; o ambiente delas está instalado e verificado, ver
+> linguagens previstas no plano (Rust, Scala, Clojure) e o HCL ainda não foram
+> integradas; o ambiente delas está instalado e verificado, ver
 > [Estado atual](#estado-atual).
 
 ## Objetivo
@@ -241,6 +241,78 @@ O erro é fácil em Elixir, onde os dois aparecem com a mesma cara. Em Erlang,
 com o prefixo `'Elixir.'` explícito, a distinção fica visível — e foi
 escrevendo a versão Erlang que ela ficou óbvia.
 
+### Gleam: o mesmo protocolo, com os erros movidos para o compilador
+
+O protocolo da ponte tem três implementações: Elixir (a fonte do formato), Go
+(o gateway) e **Gleam** — que existe para mostrar o que a tipagem estática
+sobre a BEAM muda na forma de escrever a mesma coisa.
+
+Nas duas primeiras, um quadro é um punhado de bytes com uma convenção na cabeça
+de quem escreveu. Em Gleam, é um tipo:
+
+```gleam
+pub type Frame {
+  Connect(client_id: Int)
+  Disconnect(client_id: Int)
+  Data(client_id: Int, payload: BitArray)
+  Push(client_id: Int, payload: BitArray)
+}
+
+pub fn decode(bits: BitArray) -> Result(Frame, DecodeError)
+```
+
+Três erros deixam de ser possíveis:
+
+| erro | Elixir / Go | Gleam |
+|---|---|---|
+| construir quadro sem `client_id` | roda e falha longe | não compila |
+| esquecer de tratar o tipo 4 | quadro cai no `_ ->` em silêncio | `case` não exaustivo não compila |
+| ignorar um quadro malformado | precisa de disciplina (e de teste) | `Result` obriga a tratar |
+
+O terceiro é o mais interessante: o teste *"quadro malformado não derruba o
+handler"* existe do lado Elixir **em tempo de execução**. Em Gleam, o
+compilador não deixa chamar `decode` sem lidar com o `Error`. É o mesmo bug,
+pego em dois momentos diferentes — e essa é a comparação que o projeto quer.
+
+### Um protocolo, três linguagens, os mesmos bytes
+
+O arquivo `protocolo/vetores.txt` tem 10 quadros em hexadecimal, gerados pelo
+Elixir. **As três implementações são verificadas contra ele:**
+
+| implementação | teste | o que verifica |
+|---|---|---|
+| Elixir | `test/protocolo_test.exs` | `frame/3` gera exatamente aqueles bytes |
+| Go | `bridge/bridge_test.go` | `Encode`/`Decode` conformes |
+| Gleam | `test/mesh_codec_test.gleam` | `encode`/`decode` conformes |
+
+Por que isso não é decorativo: **divergência de formato não dá exceção.** Um
+lado escrevendo o id em little-endian e o outro em big-endian produz conexões
+"não encontradas" para clientes que existem — um bug que aparece longe da
+causa, e que os testes de unidade de cada lado passariam sem notar.
+
+Os três testes começam verificando que **o arquivo foi lido e tem 10 linhas**.
+Sem isso, um caminho errado faria os testes de conformidade iterarem sobre
+lista vazia e passarem vacuamente — o jeito mais fácil de um teste de
+conformidade não testar nada.
+
+### Gleam não interopera com a BEAM: Gleam é BEAM
+
+Ler o arquivo de vetores precisava de I/O, que a biblioteca padrão do Gleam
+não tem — ela é agnóstica de plataforma. A saída não foi uma dependência:
+
+```gleam
+@external(erlang, "file", "read_file")
+fn read_file(caminho: String) -> Result(BitArray, Dynamic)
+```
+
+Chamar `file:read_file/1` do OTP direto, e o `Result` do Gleam casa com o
+`{ok, _} | {error, _}` do Erlang sem conversão, porque é a mesma
+representação. Não é FFI, não é binding, não tem custo de travessia — é
+chamada de função.
+
+É o mesmo ponto que a conexão em Erlang faz do outro lado: três linguagens
+(Elixir, Erlang, Gleam) sobre um runtime, sem camada de tradução entre elas.
+
 ### O gateway em Go: quanto custa um socket de verdade
 
 O núcleo mediu 3,8 KB por conexão — mas aquelas conexões são processos BEAM
@@ -421,6 +493,8 @@ mix run bench/erlang_vs_elixir.exs   # a mesma conexão nas duas linguagens
 cd ../../go && go test ./...   # 7 testes do WebSocket, zero dependências
 cd .. && bash bench/gateway.sh # custo de uma conexão real + efeito dos buffers
 bash tests/integracao.sh       # Go <-> Elixir de ponta a ponta
+
+cd gleam/mesh_codec && gleam test  # codec tipado, contra os mesmos vetores
 ```
 
 O benchmark para sozinho ao passar de 2 GB no BEAM. O limite é deliberado:
@@ -470,6 +544,7 @@ Três decisões estruturais:
 |---|---|---|---|
 | **Go 1.26** | gateway WebSocket, gerador de carga | Uma goroutine por conexão é o par natural de um processo por conexão, e o `net/http` com `Hijacker` dá o socket cru sem intermediário. É também a comparação que o projeto quer: a plataforma onde "um por conexão" é barato **sem** supervisão nem isolamento de falha | **Node.js**: um laço de eventos, não um por conexão — mediria outra coisa. **Rust**: mais rápido e sem GC, mas `async` exige escolher runtime, e aí a medição seria do Tokio |
 | **`ws/` escrito à mão** (zero dependências) | aperto de mão e quadros da RFC 6455 | O custo por conexão é dominado pelos buffers, e em biblioteca eles são escolha dela. Com `ws.Config` explícito, a tabela de efeito dos buffers existe — e ela mostra +35 % para o padrão herdado | **gorilla/websocket**, **coder/websocket**: ambas boas e livres; esconderiam justamente a variável sob medição |
+| **Gleam 1.19** | `gleam/mesh_codec`, terceira implementação do protocolo | Tipagem estática sobre a BEAM: o quadro deixa de ser convenção e passa a ser tipo, e três classes de erro migram de tempo de execução para tempo de compilação. O `@external` para `file:read_file/1` mostra que chamar OTP de Gleam é chamada de função, não FFI | **`simplifile`** para o I/O: traria dependência e esconderia justamente o ponto de que Gleam é BEAM |
 | **Erlang/OTP 27** | `src/mesh_conn.erl`, conexão alternativa no mesmo nó | É a prova de que Elixir e Erlang são a mesma plataforma: o `mix` compila `src/*.erl` no mesmo app, e a conexão Erlang entra na mesma árvore, no mesmo `Registry`, recebendo a mesma difusão. Escrever a versão em Erlang também expôs um bug que o Elixir escondia — `{via, Modulo, Nome}` com módulo e nome conflatados | **Repositório separado com nó distribuído**: mostraria interoperação entre nós, que é outra coisa — e esconderia justamente o fato de ser um nó só |
 | **Elixir / OTP 27** | o núcleo inteiro | A BEAM é a única plataforma mainstream em que um processo por conexão é a escolha *óbvia* e não um truque: processo de centenas de bytes, escalonador preemptivo por redução, e supervisão como parte da linguagem e não biblioteca. Medir 700 mil processos supervisionados em 2,3 GB não é possível em runtime de threads do SO | **Go**: goroutines são baratas, mas não há supervisão nem isolamento de falha — um `panic` não contido derruba o processo todo. Go entra no gateway HTTP, onde é melhor |
 | **`Registry` particionado** | nomeação das conexões | Nomeação distribuída sem processo central: cada partição é uma tabela ETS, e o `Registry` monitora os processos para limpar sozinho quando morrem. É o que faz a convergência pós-caos ser automática | **GenServer com um `Map`**: um processo central vira gargalo e ponto único de falha, e perderia o estado ao reiniciar |
@@ -631,8 +706,8 @@ etapa.
    conta de memória de uma conexão real.
 3. ~~**Supervisão em Erlang puro**~~ **Feito.** `mesh_conn.erl` no mesmo nó,
    com benchmark comparativo: um byte de diferença por conexão.
-4. **Serviço em Gleam** na mesma BEAM, para mostrar tipagem estática sobre o
-   mesmo runtime.
+4. ~~**Serviço em Gleam** na mesma BEAM~~ **Feito.** Codec tipado do
+   protocolo, verificado contra os mesmos vetores de bytes do Elixir e do Go.
 5. **Caminho crítico em Rust** via NIF, medindo o custo da travessia.
 6. **Distribuição** com dois nós BEAM e `Registry` global.
 7. **NATS** como barramento entre nós.
@@ -653,6 +728,13 @@ etapa.
   devolvia medição não convergida em silêncio, como o do P01. Saber que um
   modo de falha existe não impede de reintroduzi-lo — o que impede é a
   ferramenta reclamar.
+- **A tipagem estática move o erro de lugar, não o elimina.** As três classes
+  de erro que o Gleam pega em compilação são as mesmas que o Elixir pega em
+  teste. O que muda é quando você descobre — e quanto custa descobrir tarde.
+- **Um arquivo de vetores vale mais que três suítes isoladas.** Divergência de
+  formato entre linguagens não dá exceção: dá comportamento errado silencioso.
+  Dez linhas de hexadecimal compartilhadas resolvem o que nenhum teste de
+  unidade pegaria.
 - **Elixir e Erlang são a mesma plataforma, e agora tenho o número.** 3.304
   contra 3.305 bytes por conexão. A escolha entre as duas é ergonomia, e quem
   disser que uma é mais rápida que a outra para o mesmo algoritmo precisa
@@ -709,7 +791,7 @@ etapa.
 | Conexão como processo, com contrapressão | ✅ |
 | Caos: matar fração das conexões | ✅ supervisor sobrevive, convergência medida |
 | Caos: matar processo `:permanent` | ✅ reinício em 5,83 ms, estado reconstruído |
-| Suíte ExUnit | ✅ 22/22, estável em 15 execuções seguidas |
+| Suíte ExUnit | ✅ 26/26, estável em 15 execuções seguidas |
 | Benchmark de capacidade | ✅ 700 mil conexões, 3.783 bytes cada |
 | Benchmark de difusão, 3 implementações | ✅ intercalado, com dispersão reportada |
 | Fanout particionado | ✅ ~3x medido; +7% de memória por conexão |
@@ -718,7 +800,9 @@ etapa.
 | Ponte gateway ↔ núcleo | ✅ TCP `packet: 4`, 7 testes + integração no CI |
 | Teste de integração entre as linguagens | ✅ 500 WebSockets → 500 processos |
 | **Erlang** no mesmo nó | ✅ `mesh_conn.erl`, 5 testes, benchmark comparativo |
-| Gleam, Rust, Scala, Clojure | ⬜ ambiente pronto, não integrados |
+| **Gleam** — codec tipado do protocolo | ✅ 13 testes, conformes aos vetores |
+| Protocolo verificado em 3 linguagens | ✅ Elixir, Go e Gleam contra `protocolo/vetores.txt` |
+| Rust, Scala, Clojure | ⬜ ambiente pronto, não integrados |
 | Distribuição entre nós | ⬜ |
 | NATS, OpenTofu, kind em uso | ⬜ instalados e verificados, não integrados |
 | CI | ⬜ |

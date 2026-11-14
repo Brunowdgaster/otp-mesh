@@ -58,12 +58,35 @@ func Dial(addr string, onPush func(clientID uint64, payload []byte)) (*Conn, err
 	return c, nil
 }
 
-func (c *Conn) enviar(tipo byte, clientID uint64, payload []byte) error {
-	// 1 byte de tipo + 8 de id + payload, prefixado pelo tamanho.
+// Encode monta o corpo de um quadro, SEM o prefixo de tamanho.
+//
+// Exportada e separada do envio por dois motivos. O primeiro é testabilidade:
+// verificar o formato não deve exigir um socket. O segundo é conformidade — os
+// bytes daqui são comparados com os vetores em protocolo/vetores.txt, gerados
+// pelo Elixir e também verificados pela implementação em Gleam. Três
+// linguagens, um formato, verificado contra o mesmo arquivo.
+func Encode(tipo byte, clientID uint64, payload []byte) []byte {
 	corpo := make([]byte, 9+len(payload))
 	corpo[0] = tipo
 	binary.BigEndian.PutUint64(corpo[1:9], clientID)
 	copy(corpo[9:], payload)
+	return corpo
+}
+
+// Decode separa um corpo de quadro em seus campos.
+func Decode(corpo []byte) (tipo byte, clientID uint64, payload []byte, err error) {
+	if len(corpo) < 9 {
+		return 0, 0, nil, fmt.Errorf("bridge: quadro de %d bytes, menor que o cabecalho de 9", len(corpo))
+	}
+	tipo = corpo[0]
+	if tipo < TipoConnect || tipo > TipoPush {
+		return 0, 0, nil, fmt.Errorf("bridge: tipo de quadro desconhecido: %d", tipo)
+	}
+	return tipo, binary.BigEndian.Uint64(corpo[1:9]), corpo[9:], nil
+}
+
+func (c *Conn) enviar(tipo byte, clientID uint64, payload []byte) error {
+	corpo := Encode(tipo, clientID, payload)
 
 	var cab [4]byte
 	binary.BigEndian.PutUint32(cab[:], uint32(len(corpo)))
@@ -117,12 +140,9 @@ func (c *Conn) lerQuadro() (tipo byte, clientID uint64, payload []byte, err erro
 	if n > MaxQuadro {
 		return 0, 0, nil, fmt.Errorf("%w: %d bytes", ErrQuadroGrande, n)
 	}
-	if n < 9 {
-		return 0, 0, nil, errors.New("bridge: quadro menor que o cabecalho")
-	}
 	corpo := make([]byte, n)
 	if _, err := io.ReadFull(c.raw, corpo); err != nil {
 		return 0, 0, nil, err
 	}
-	return corpo[0], binary.BigEndian.Uint64(corpo[1:9]), corpo[9:], nil
+	return Decode(corpo)
 }
