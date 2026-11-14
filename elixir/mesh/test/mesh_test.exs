@@ -117,12 +117,33 @@ defmodule MeshTest do
       assert len < 100
     end
 
-    test "broadcast endereça todas as conexões vivas" do
+    test "broadcast particionado chega em todas as conexoes" do
+      # A versao anterior deste teste verificava o RETORNO do broadcast (quantas
+      # foram enderecadas). Com a difusao particionada nao ha retorno util: a
+      # contagem exigiria uma consulta extra ou juntar resultados dos processos
+      # paralelos, o que desfaria o ganho. Verificar a CHEGADA e melhor teste de
+      # qualquer forma -- enderecar e uma promessa, receber e um fato.
       {50, 0} = Mesh.open_many(50)
-      assert Mesh.broadcast({:oi, 1}) == 50
-      Process.sleep(100)
-      assert Mesh.snapshot().entregas >= 50
+      assert :ok = Mesh.broadcast({:oi, 1})
+      wait_until(fn -> recebidas(0..49) == 50 end, 2_000)
+      assert recebidas(0..49) == 50
     end
+
+    test "serial e particionado entregam o mesmo" do
+      {30, 0} = Mesh.open_many(30)
+
+      Mesh.broadcast_serial({:a, 1})
+      wait_until(fn -> recebidas(0..29) == 30 end, 2_000)
+      assert recebidas(0..29) == 30
+
+      Mesh.broadcast({:b, 2})
+      wait_until(fn -> recebidas(0..29) == 60 end, 2_000)
+      assert recebidas(0..29) == 60
+    end
+  end
+
+  defp recebidas(faixa) do
+    faixa |> Enum.map(&Mesh.Connection.stats(&1).received) |> Enum.sum()
   end
 
   defp wait_until(fun, timeout_ms) do

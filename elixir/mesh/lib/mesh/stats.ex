@@ -29,7 +29,19 @@ defmodule Mesh.Stats do
 
   def start_link(_opts), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
 
-  @doc "Conta uma entrega aceita."
+  @doc """
+  Conta entregas, quando o produtor quiser contabilizar.
+
+  `Mesh.broadcast/1` **não** chama esta função, e a omissão é deliberada: a
+  difusão é particionada em um processo por partição do registro, então saber o
+  total exigiria ou uma consulta extra ao registro antes do envio, ou juntar os
+  resultados dos processos paralelos — e qualquer das duas desfaz o ganho que a
+  paralelização trouxe.
+
+  Quem precisa do número conta na ponta: cada `Mesh.Connection` mantém o próprio
+  `received`, que é a informação verdadeira — endereçar é uma promessa, receber
+  é um fato.
+  """
   def delivered(n \\ 1), do: GenServer.cast(__MODULE__, {:delivered, n})
 
   @doc "Conta uma mensagem descartada por contrapressão."

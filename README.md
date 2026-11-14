@@ -123,16 +123,65 @@ aceitas + descartadas == enviadas
 Nenhuma mensagem desaparece em silêncio. Um número de descartes é informação;
 uma latência que cresce sem ninguém ver, não é.
 
-### O gargalo real que apareceu: difusão de um processo só
+### O gargalo da difusão, e a correção medida
 
-Difundir para 700 mil conexões levou **2,7 s**, contra 228 ms para 100 mil. O
-crescimento é pior que linear, e a causa é arquitetural: um único processo
-emitindo 700 mil `cast` é serial por definição, e vira o gargalo muito antes
-de a memória acabar.
+Difundir para 700 mil conexões levava **2,7 s**, contra 228 ms para 100 mil:
+crescimento pior que linear, porque um único processo emitindo 700 mil `cast` é
+serial por definição.
 
-A correção é *fanout* em árvore ou particionado — está no roadmap. Registrar o
-gargalo com número é mais útil que esconder atrás de um benchmark que não o
-exercita.
+A correção veio da própria biblioteca padrão. `Registry.dispatch/4` com
+`parallel: true` invoca o callback **uma vez por partição, em processos
+distintos** — ou seja, o fanout particionado já estava pronto, e eu o estava
+reimplementando serialmente. O custo é um segundo registro, com chaves
+duplicadas, servindo de tópico.
+
+Três implementações, medidas **intercaladas** na mesma sessão, melhor de 5:
+
+| conexões | serial | lotes | partição | ganho lotes | ganho partição | disp. |
+|---|---|---|---|---|---|---|
+| 10.000 | 16,9 ms | 23,3 ms | **5,1 ms** | 0,73x | 3,31x | 45 % |
+| 50.000 | 148,9 ms | 80,3 ms | **51,3 ms** | 1,85x | 2,90x | 78 % |
+| 100.000 | 225,4 ms | 80,5 ms | **66,6 ms** | 2,80x | 3,38x | 107 % |
+| 200.000 | 530,9 ms | 176,0 ms | **142,5 ms** | 3,02x | 3,73x | 93 % |
+
+- **serial** — um processo percorre tudo e emite cada `cast`.
+- **lotes** — `Task.async_stream` sobre o registro **já existente**, sem
+  segundo registro.
+- **partição** — `Registry.dispatch` com `parallel: true`.
+
+A dispersão é da ordem do ganho, então **o multiplicador exato não está
+estabelecido** — lição que o P01 ensinou. O que está: a ordenação é a mesma nos
+quatro degraus, e as duas versões paralelas melhoram conforme a escala cresce,
+que é o que o mecanismo prevê (o custo fixo de criar processos se amortiza). A
+versão em lotes chega a **perder** da serial em 10 mil conexões, onde o
+overhead do `Task.async_stream` domina.
+
+### A medição de memória que eu errei primeiro
+
+O segundo registro custa memória, e a primeira medição disse **+72% por
+conexão** — o que derrubaria a capacidade de 700 mil para ~400 mil e tornaria a
+troca questionável.
+
+O número estava errado. Ele vinha de `:erlang.memory/1` chamado no fim do
+benchmark de difusão, **depois de milhões de mensagens em voo**: contava o lixo
+do próprio benchmark, não o custo do registro.
+
+A comparação limpa é rodar o mesmo `bench/capacity.exs` nas duas versões, que
+não difunde em volume:
+
+| | sem registro de difusão | com |
+|---|---|---|
+| bytes por conexão a 700 mil | 3.534 | **3.783** |
+| BEAM total | 2.359 MB | 2.526 MB |
+
+**+249 bytes por conexão, +7%** — e a capacidade máxima não muda na prática.
+Sete por cento de memória compra ~3x de velocidade de difusão, então
+`broadcast/1` particionado passou a ser o padrão. A versão em lotes fica como
+alternativa sem custo de registro, e como a referência que estabeleceu o
+número.
+
+*Lição, de novo:* o instrumento de medição precisa ser verificado como o
+sistema. `:erlang.memory/1` é correto; chamá-lo no lugar errado não é.
 
 ## Ambiente: zero recursos pagos
 
@@ -161,6 +210,7 @@ bash tests/smoke.sh all        # prova que o ambiente funciona: 11 verificaçõe
 cd elixir/mesh
 mix test                       # 8 testes: ciclo de vida, caos, contrapressão
 mix run bench/capacity.exs     # a rampa até 700 mil + caos + extrapolação
+mix run bench/fanout.exs       # as três difusões, intercaladas
 ```
 
 O benchmark para sozinho ao passar de 2 GB no BEAM. O limite é deliberado:
@@ -312,8 +362,10 @@ etapa.
   deles está instalado e verificado, o que é diferente de estar em uso.
 - **Nó único.** Não há distribuição BEAM, nem particionamento entre nós, nem
   `Horde`/`libcluster`. Toda a medição é de um processo `beam.smp`.
-- **Difusão serial.** 2,7 s para 700 mil é o gargalo arquitetural identificado,
-  e não foi corrigido ainda.
+- **A difusão melhorou ~3x mas segue não escalando de graça.** 142 ms para
+  200 mil conexões com oito escalonadores; a próxima barreira é a emissão de
+  `cast` em si, que é uma mensagem por destino. Reduzir isso exigiria agrupar
+  destinatários por nó ou trocar difusão por *pull*, o que muda a semântica.
 - **Conexões são simuladas.** Não há socket, nem TCP, nem WebSocket: são
   processos com estado, que é o que o projeto quer medir. Um socket real
   acrescentaria ~10 KB de buffers por conexão e mudaria o número de capacidade
@@ -328,7 +380,8 @@ etapa.
 
 ## Roadmap
 
-1. **Fanout particionado**, para atacar o gargalo de 2,7 s medido.
+1. ~~**Fanout particionado**~~ **Feito.** ~3x medido, três implementações
+   comparadas, custo de memória estabelecido em +7% por conexão.
 2. **Gateway em Go** com WebSocket real, medindo quanto um socket de verdade
    custa por conexão em relação aos 3,5 KB do processo puro.
 3. **Supervisão em Erlang puro** do mesmo núcleo, para a comparação que o
@@ -355,6 +408,14 @@ etapa.
   devolvia medição não convergida em silêncio, como o do P01. Saber que um
   modo de falha existe não impede de reintroduzi-lo — o que impede é a
   ferramenta reclamar.
+- **A biblioteca padrão já tinha a resposta.** Eu estava reimplementando
+  serialmente um fanout que o `Registry.dispatch/4` faz particionado desde
+  sempre. Antes de otimizar, vale ler o que a plataforma oferece — e a BEAM
+  oferece muito.
+- **Errei a medição de memória antes de errar a de tempo.** Reportei +72% de
+  custo por conexão porque chamei `:erlang.memory/1` depois de milhões de
+  mensagens em voo. O instrumento estava certo; o lugar da chamada, errado. A
+  comparação limpa deu +7%, e a decisão de engenharia mudou com ela.
 - **Três vezes o mesmo modo de falha, em três projetos.** Harness de benchmark,
   injetor de caos e provisionador: todos redirecionavam a saída e ignoravam o
   código de retorno. Conhecer um modo de falha não imuniza contra ele; o que
@@ -379,9 +440,10 @@ etapa.
 | Conexão como processo, com contrapressão | ✅ |
 | Caos: matar fração das conexões | ✅ supervisor sobrevive, convergência medida |
 | Caos: matar processo `:permanent` | ✅ reinício em 5,83 ms, estado reconstruído |
-| Suíte ExUnit | ✅ 9/9, estável em 15 execuções seguidas |
-| Benchmark de capacidade | ✅ 700 mil conexões, 3.534 bytes cada |
-| Fanout particionado | ⬜ gargalo de 2,7 s identificado |
+| Suíte ExUnit | ✅ 10/10, estável em 15 execuções seguidas |
+| Benchmark de capacidade | ✅ 700 mil conexões, 3.783 bytes cada |
+| Benchmark de difusão, 3 implementações | ✅ intercalado, com dispersão reportada |
+| Fanout particionado | ✅ ~3x medido; +7% de memória por conexão |
 | Gateway em Go, WebSocket real | ⬜ |
 | Erlang, Gleam, Rust, Scala, Clojure | ⬜ ambiente pronto, não integrados |
 | Distribuição entre nós | ⬜ |

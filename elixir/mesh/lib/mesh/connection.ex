@@ -35,6 +35,7 @@ defmodule Mesh.Connection do
   use GenServer, restart: :temporary
 
   @max_queue 100
+  @topic "all"
 
   defstruct [:id, received: 0, dropped: 0]
 
@@ -61,7 +62,13 @@ defmodule Mesh.Connection do
   # --------------------------------------------------------------- callbacks
 
   @impl true
-  def init(id), do: {:ok, %__MODULE__{id: id}}
+  def init(id) do
+    # Assina o tópico de difusão. O registro em `Mesh.Registry` (único) vem do
+    # `:via` no `start_link`; este aqui é o de chaves duplicadas, que permite a
+    # difusão particionada.
+    {:ok, _} = Registry.register(Mesh.PubSub, @topic, nil)
+    {:ok, %__MODULE__{id: id}}
+  end
 
   @impl true
   def handle_cast({:deliver, _payload}, state) do

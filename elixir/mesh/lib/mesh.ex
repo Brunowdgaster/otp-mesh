@@ -90,28 +90,96 @@ defmodule Mesh do
   @doc "Número de conexões vivas, lido do Registry."
   def count, do: Registry.count(Mesh.Registry)
 
-  @doc "Lista os pids de todas as conexões vivas."
+  @doc """
+  Lista os pids de todas as conexões vivas, lendo do `Registry`.
+
+  A primeira versão usava `DynamicSupervisor.which_children/1`, que é uma
+  chamada **síncrona ao processo supervisor**: ele monta a lista inteira a
+  partir do próprio estado e a copia para quem pediu. Com 700 mil filhos isso
+  entra no caminho de medição do teste de caos e passa a medir o supervisor, não
+  o sistema.
+
+  O `Registry` guarda os pids em ETS particionada, e `select/2` lê sem envolver
+  processo nenhum.
+  """
   def pids do
-    Mesh.ConnSupervisor
-    |> DynamicSupervisor.which_children()
-    |> Enum.map(fn {_, pid, _, _} -> pid end)
-    |> Enum.filter(&is_pid/1)
+    Registry.select(Mesh.Registry, [{{:_, :"$1", :_}, [], [:"$1"]}])
   end
 
+  @topic "all"
+
   @doc """
-  Difunde `payload` para todas as conexões.
+  Difunde `payload` para todas as conexões, **em paralelo por partição**.
+
+  `Registry.dispatch/4` com `parallel: true` invoca o callback uma vez por
+  partição do registro, cada uma num processo próprio. Com oito escalonadores
+  são oito processos emitindo `cast` ao mesmo tempo, em vez de um.
 
   O envio é assíncrono e **pode ser descartado** pela conexão de destino se a
   caixa de mensagens dela estiver cheia — ver a contrapressão em
-  `Mesh.Connection`. O retorno é quantas foram endereçadas, não quantas foram
-  processadas, e a diferença entre os dois números é o ponto: aparece em
+  `Mesh.Connection`. A diferença entre endereçadas e processadas aparece em
   `descartes` no `Mesh.Stats.snapshot/0`.
+
+  Compare com `broadcast_serial/1`: a medição está no README.
   """
   def broadcast(payload) do
-    pids = pids()
-    Enum.each(pids, &GenServer.cast(&1, {:deliver, payload}))
-    Mesh.Stats.delivered(length(pids))
-    length(pids)
+    Registry.dispatch(
+      Mesh.PubSub,
+      @topic,
+      fn entries ->
+        Enum.each(entries, fn {pid, _} -> GenServer.cast(pid, {:deliver, payload}) end)
+      end,
+      parallel: true
+    )
+  end
+
+  @doc """
+  Difusão paralela **sobre o registro que já existe**, sem segundo registro.
+
+  Lê os pids uma vez (`Registry.select/2`, que é serial) e divide o trabalho de
+  envio em lotes processados concorrentemente por `Task.async_stream/3`.
+
+  Existe por dois motivos. O primeiro é não exigir o segundo registro: se você
+  não quiser a entrada extra por conexão, esta é a versão a usar. O segundo é
+  mais interessante — foi ela que permitiu medir **quanto o segundo registro
+  custa de verdade**.
+
+  A primeira medição apontou +72% de memória por conexão para o registro de
+  difusão, e o número estava errado: vinha de `:erlang.memory/1` chamado depois
+  de milhões de mensagens em voo, ou seja, contava o lixo do próprio benchmark.
+  Medido com a mesma carga do `bench/capacity.exs`, o custo real é **+249 bytes
+  por conexão, +7%** — e a capacidade máxima da máquina não muda na prática.
+
+  Com isso, `broadcast/1` particionado passou a ser o padrão: ~3x mais rápido
+  por 7% de memória. Esta versão fica como alternativa sem custo de registro e
+  como a referência que estabeleceu o número.
+  """
+  def broadcast_chunked(payload, lote \\ 10_000) do
+    pids()
+    |> Stream.chunk_every(lote)
+    |> Task.async_stream(
+      fn chunk -> Enum.each(chunk, &GenServer.cast(&1, {:deliver, payload})) end,
+      ordered: false,
+      max_concurrency: System.schedulers_online(),
+      timeout: 60_000
+    )
+    |> Stream.run()
+  end
+
+  @doc """
+  Difusão serial, de um processo só. **Mantida apenas para comparação.**
+
+  Era a implementação original de `broadcast/1`, e levava 2,7 s para 700 mil
+  conexões contra 228 ms para 100 mil — crescimento pior que linear, porque um
+  único processo emitindo centenas de milhares de `cast` é serial por definição.
+
+  Usa o mesmo registro e faz o mesmo trabalho que `broadcast/1`; a única
+  diferença é não paralelizar. É o que torna a comparação justa.
+  """
+  def broadcast_serial(payload) do
+    Mesh.PubSub
+    |> Registry.lookup(@topic)
+    |> Enum.each(fn {pid, _} -> GenServer.cast(pid, {:deliver, payload}) end)
   end
 
   @doc "Fotografia do mesh. Ver `Mesh.Stats.snapshot/0`."

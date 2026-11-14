@@ -44,6 +44,17 @@ defmodule Mesh.Application do
       # contenção de escrita quando milhares de processos se registram ao mesmo
       # tempo. Com uma partição só, o registro vira o gargalo antes da memória.
       {Registry, keys: :unique, name: Mesh.Registry, partitions: System.schedulers_online()},
+      # Segundo registro, com chaves DUPLICADAS, usado só para difusão.
+      #
+      # Ele existe porque `Registry.dispatch/4` com `parallel: true` invoca o
+      # callback uma vez por partição, em processos distintos -- ou seja, o
+      # fanout particionado já está pronto na biblioteca padrão. A primeira
+      # versão deste projeto percorria a lista de pids num processo só e levava
+      # 2,7 s para 700 mil conexões; ver o README.
+      #
+      # O custo é uma entrada ETS a mais por conexão: **+249 bytes, +7%**,
+      # medido com a mesma carga do bench/capacity.exs. Compra ~3x na difusão.
+      {Registry, keys: :duplicate, name: Mesh.PubSub, partitions: System.schedulers_online()},
       Mesh.Stats,
       {DynamicSupervisor, name: Mesh.ConnSupervisor, strategy: :one_for_one}
     ]
