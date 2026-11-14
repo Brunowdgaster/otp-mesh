@@ -142,6 +142,37 @@ jobs:
         working-directory: scala/loadgen
         run: scala-cli run Preempcao.scala --jvm system -- 4 2
 
+  # Carga pequena de proposito: os numeros de contencao dependem do numero de
+  # nucleos (o runner tem 2, a maquina local 8) e runner compartilhado nao
+  # serve de linha de base. O que o job verifica e o que NAO depende da
+  # maquina: que todos os mecanismos coordenados contam certo, e que o sem
+  # coordenacao perde atualizacoes. Isso vale em qualquer numero de nucleos.
+  clojure:
+    runs-on: ubuntu-latest
+    name: contencao em Clojure
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: instalar clojure
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clojure
+          clojure -e '(println "clojure" (clojure-version))'
+      - name: contencao, e o sem-coordenacao perdendo atualizacoes
+        working-directory: clojure/contencao
+        run: |
+          set -euo pipefail
+          clojure contencao.clj 4 50000 | tee /tmp/saida.txt
+          # Os quatro mecanismos coordenados tem de contar certo.
+          corretos=$(grep -cE '^(AtomicLong|atom|ref|agent).*sim$' /tmp/saida.txt)
+          test "$corretos" -eq 4 || { echo "esperava 4 corretos, achei $corretos"; exit 1; }
+          # E o STM nao pode ter violacao de invariante entre dois refs.
+          grep -qE '^dois refs \(STM\) +1000000 +0$' /tmp/saida.txt             || { echo "STM violou a invariante dos dois contadores"; exit 1; }
+
   gleam:
     runs-on: ubuntu-latest
     name: codec em Gleam

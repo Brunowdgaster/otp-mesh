@@ -33,8 +33,8 @@ conexões      abrir (ms)   BEAM (MB)  bytes/conn  broadcast (ms)
 > **Status:** o **núcleo em Elixir/OTP, o gateway em Go e a ponte entre os
 > dois** estão completos e medidos — 500 WebSockets reais viram 500 processos
 > supervisionados, verificado por teste de integração no CI. As outras quatro
-> linguagens previstas no plano (Clojure) e o HCL ainda não foram integradas;
-> o ambiente delas está instalado e verificado, ver
+> o HCL (OpenTofu) ainda não foi integrado; o ambiente está instalado e
+> verificado, ver
 > [Estado atual](#estado-atual).
 
 ## Objetivo
@@ -585,6 +585,150 @@ Também: o laço dos *hogs* precisa de uma condição que o JIT não elimine
 conclusão seria "não houve inanição" por um motivo que nada tem a ver com
 escalonamento.
 
+### Clojure: estado compartilhado, e os dois números que eu não acreditei
+
+O `Mesh.Stats` do núcleo é um GenServer com contadores: toda atualização passa
+pela caixa de mensagens dele, o que **serializa** as escritas. É a resposta da
+BEAM para estado compartilhado — *não compartilhe, ponha num processo e mande
+mensagens*.
+
+Clojure dá a resposta oposta — *compartilhe, mas torne a mutação coordenada* — e
+dá **quatro** mecanismos para isso. Medir os dois lados com a mesma carga diz
+quanto o padrão idiomático da BEAM custa, e o que ele compra.
+
+Carga: **8 trabalhadores × 200 mil incrementos = 1,6 milhão**, num contador.
+
+#### Lado da JVM (`clojure/contencao/contencao.clj`)
+
+| estratégia | ops/s | contador final | correto? |
+|---|---|---|---|
+| sem coordenação | **32.018.249** | **477.703** | **NÃO** |
+| `AtomicLong` (JDK) | 31.146.643 | 1.600.000 | sim |
+| `atom` (CAS) | 6.432.101 | 1.600.000 | sim |
+| `agent` (fila) | 534.166 | 1.600.000 | sim |
+| `ref` (STM) | 62.065 | 1.600.000 | sim |
+
+A primeira linha é a mais importante da tabela: ela é **a mais rápida e está
+errada**. Perdeu **70% das atualizações** — sem exceção, sem aviso, só um número
+menor que o esperado. É uma leitura-modificação-escrita não atômica, e duas
+threads que leem o mesmo valor escrevem o mesmo incremento.
+
+E a linha seguinte mostra que não há troca a fazer: o `AtomicLong` é
+**igualmente rápido e correto** (31,1 contra 32,0 milhões — 2,7% de diferença).
+A versão sem coordenação não é "rápida e insegura", é só errada de graça.
+
+Depois disso o custo escala com o que cada mecanismo coordena: o `atom` é 4,8x
+mais lento que o `AtomicLong` (laço de retentativa sobre valor imutável), e o
+`ref` é **500x mais lento** — porque STM coordena *várias* referências, e pagar
+por STM para incrementar um contador é pagar por algo que não se usa.
+
+#### O que o atom não faz, e o ref faz
+
+Transferir entre **dois** contadores conservando a soma, com cada thread
+verificando a soma logo depois de mexer nos dois:
+
+| mecanismo | soma final | violações observadas |
+|---|---|---|
+| dois `atom` | 1.000.000 ✅ | **130.235** |
+| dois `ref` (STM) | 1.000.000 ✅ | **0** |
+
+A soma **final** fecha nos dois: cada `swap!` é atômico e nenhum incremento se
+perde. O que difere é o **meio**: com dois atoms, `swap! a` e `swap! b` são duas
+operações, e nada impede outra thread de observar o estado entre elas. Dentro de
+`dosync`, não existe esse meio.
+
+É exatamente o que justifica os 500x da linha do STM — e por que usá-lo num
+contador é desperdício.
+
+#### Lado da BEAM (`bench/contencao.exs`)
+
+| mecanismo | ops/s | correto? |
+|---|---|---|
+| `:counters` | **106.354.693** | sim |
+| `:atomics` | 32.149.172 | sim |
+| `:ets`, 1 chave por worker | 32.136.258 | sim |
+| `GenServer` cast `off_heap` | 4.304.547 | sim |
+| `GenServer` call | 492.567 | sim |
+| `GenServer` cast (on-heap) | **17.106** | sim |
+| `:ets`, 1 chave só | **16.057** | sim |
+
+**Todos contam certo.** Correção não é o que separa estes mecanismos — o que
+separa é contenção. E 6.623x de diferença entre o primeiro e o último.
+
+#### Comparando as duas plataformas
+
+| modelo | JVM / Clojure | BEAM | quem ganha |
+|---|---|---|---|
+| contador sem bloqueio | `AtomicLong` 31,1 M | `:counters` **106,4 M** | BEAM, 3,4x |
+| CAS sobre valor imutável | `atom` 6,4 M | `:atomics` 32,1 M | BEAM, 5x |
+| **fila + guardião** | `agent` **534 k** | `GenServer` call **493 k** | **empate** |
+| transação multi-referência | `ref` (STM) 62 k | — | só a JVM tem |
+
+Duas leituras:
+
+**`:counters` da BEAM bate o `AtomicLong` por 3,4x** porque não é uma palavra
+única: com `write_concurrency` ele é fragmentado por escalonador, então não há
+linha de cache disputada. O `AtomicLong` é uma palavra e paga o *bouncing*.
+
+**O `agent` e o `GenServer` empatam** — 534 mil contra 493 mil, 8% de diferença.
+Os dois são "uma fila, um guardião, escritas serializadas", e o modelo custa o
+mesmo nas duas plataformas. A BEAM não é mágica aqui; ela só torna esse modelo o
+caminho padrão em vez de uma biblioteca.
+
+#### Os dois números que eu não acreditei, e o que eles eram
+
+Duas linhas da tabela da BEAM saíram absurdas na primeira medição. Nenhuma era
+erro de medição: as duas eram achados.
+
+**`:ets` a 16 mil ops/s**, quando ETS faz milhões. E **`cast` 24x mais lento que
+`call`** — assíncrono perdendo para síncrono é sinal de patologia, não de
+benchmark ruim.
+
+**Achado 1: `write_concurrency` fragmenta por chave, e na mesma chave piora.**
+Variando o número de trabalhadores com o total fixo em 1,6 milhão:
+
+| workers | 1 chave só | 1 chave por worker |
+|---|---|---|
+| 1 | 3.596.201 | 3.715.098 |
+| 2 | 6.593.859 | 5.187.916 |
+| 4 | **93.238** | 8.098.846 |
+| 8 | **17.012** | **24.122.543** |
+
+A mesma tabela, a mesma opção, **1.400x de diferença** — só pela distribuição
+das chaves. Na coluna da esquerda, *adicionar núcleos deixa 200x mais lento*: os
+escalonadores disputam a mesma linha de cache.
+
+E o único jeito de ver isso é **variar o número de trabalhadores**. Com uma
+medição só, o número parece simplesmente "ruim" e a causa fica invisível.
+
+**Achado 2: `cast` mais lento que `call` é falta de contrapressão.** A caixa do
+GenServer chegou a **811.462 mensagens**. Com a caixa no heap do processo, cada
+coleta de lixo varre a fila inteira, repetidamente.
+
+| | 1 worker | 8 workers |
+|---|---|---|
+| cast, caixa no heap | 3.457.650 | **17.906** |
+| cast, `message_queue_data: :off_heap` | 1.236.938 | **4.544.460** |
+
+Sob contenção, `off_heap` rende **254x**. Com um trabalhador só, fica **2,8x mais
+lento** — a opção não é gratuita: troca varredura de GC por alocação.
+
+E o `call` é mais lento por operação mas **auto-limitado**: cada remetente espera
+a resposta, então a caixa nunca cresce. **`call` dá contrapressão de graça;
+`cast` a remove.** É o mesmo tema da [seção de contrapressão](#a-contrapressão-descarta-e-conta-o-que-descartou)
+deste projeto, numa escala diferente — e foi a terceira vez que ele apareceu
+aqui por um caminho que eu não esperava.
+
+#### O GenServer não é desperdício
+
+Ele perde por 200x para `:counters` e é o que o `Mesh.Stats` usa. O custo não é
+desperdício: ele é um processo **supervisionado**, com estado **isolado**, que
+pode ser **reiniciado** sem levar o resto, e cujo estado é **inspecionável** em
+produção. `:counters` não tem nada disso.
+
+A escolha é entre vazão e propriedades operacionais, não entre certo e errado —
+que é a mesma forma da conclusão da seção do Scala, chegando por outro caminho.
+
 ### O gateway em Go: quanto custa um socket de verdade
 
 O núcleo mediu 3,8 KB por conexão — mas aquelas conexões são processos BEAM
@@ -783,6 +927,12 @@ cd ../../scala/loadgen
 scala-cli run Concorrencia.scala -- platform 64000   # bate o muro em ~30 mil
 scala-cli run Concorrencia.scala -- virtual  700000  # 1.323 bytes/unidade
 scala-cli run Preempcao.scala    -- 4 2              # inanicao: nunca roda
+
+# Contencao em estado compartilhado: JVM contra BEAM, mesma carga.
+cd ../../clojure/contencao
+clojure contencao.clj 8 200000            # 5 mecanismos, um deles ERRADO
+cd ../../elixir/mesh
+mix run bench/contencao.exs 8 200000      # 7 mecanismos da BEAM
 ```
 
 O benchmark para sozinho ao passar de 2 GB no BEAM. O limite é deliberado:
@@ -832,6 +982,7 @@ Três decisões estruturais:
 |---|---|---|---|
 | **Go 1.26** | gateway WebSocket, gerador de carga | Uma goroutine por conexão é o par natural de um processo por conexão, e o `net/http` com `Hijacker` dá o socket cru sem intermediário. É também a comparação que o projeto quer: a plataforma onde "um por conexão" é barato **sem** supervisão nem isolamento de falha | **Node.js**: um laço de eventos, não um por conexão — mediria outra coisa. **Rust**: mais rápido e sem GC, mas `async` exige escolher runtime, e aí a medição seria do Tokio |
 | **`ws/` escrito à mão** (zero dependências) | aperto de mão e quadros da RFC 6455 | O custo por conexão é dominado pelos buffers, e em biblioteca eles são escolha dela. Com `ws.Config` explícito, a tabela de efeito dos buffers existe — e ela mostra +35 % para o padrão herdado | **gorilla/websocket**, **coder/websocket**: ambas boas e livres; esconderiam justamente a variável sob medição |
+| **Clojure 1.12** | `clojure/contencao`, contenção em estado compartilhado | O `Mesh.Stats` serializa contadores por caixa de mensagens; Clojure oferece quatro coordenações alternativas (atom, ref/STM, agent, mais o `AtomicLong` do JDK) e medi-las diz o que o padrão da BEAM custa e compra. Achou que `agent` e `GenServer` **empatam** (534 k contra 493 k), que `:counters` bate `AtomicLong` por 3,4x, e que a versão sem coordenação é a mais rápida **e perde 70% das atualizações** | **core.async**: traria seu próprio escalonador e mediria a biblioteca, não a linguagem. Atom, ref e agent são todos de `clojure.core` — o projeto segue sem dependências |
 | **Scala 3.10 + JDK 25** | `scala/loadgen`, custo e escalonamento da concorrência | Loom promete o que a BEAM promete — "crie uma por conexão" — e a comparação direta é o que dá sentido aos 3.534 bytes do projeto. Resultado: a thread virtual é **mais barata** (1.323 contra 2.732 bytes) e **sofre inanição completa** sob carga de CPU, onde a BEAM degrada 21x. Mede também o muro da thread de plataforma: 30.568 e OOM | **Akka/Pekko ou Cats Effect**: trariam seu próprio escalonador e mediriam a biblioteca, não a plataforma. O JDK tem `Thread.ofVirtual` e cliente WebSocket embutidos, então o projeto segue sem dependências |
 | **Rust 1.93 + rustler** | `native/mesh_nif`, codec como NIF | Existe para **medir o custo da travessia** BEAM↔nativo, que é a decisão que todo projeto BEAM enfrenta e quase ninguém mede. Resultado: ~30 ns por chamada, e o NIF não venceu acima do ruído em nenhum tamanho até 1 MiB | **NIF à mão contra a ABI do `erl_nif.h`**: dezenas de linhas de `unsafe extern "C"` e conversão manual de termos — mediria a qualidade do meu boilerplate, não o custo real. `rustler` é o que se usaria de verdade |
 | **Gleam 1.19** | `gleam/mesh_codec`, terceira implementação do protocolo | Tipagem estática sobre a BEAM: o quadro deixa de ser convenção e passa a ser tipo, e três classes de erro migram de tempo de execução para tempo de compilação. O `@external` para `file:read_file/1` mostra que chamar OTP de Gleam é chamada de função, não FFI | **`simplifile`** para o I/O: traria dependência e esconderia justamente o ponto de que Gleam é BEAM |
@@ -1020,6 +1171,19 @@ etapa.
   devolvia medição não convergida em silêncio, como o do P01. Saber que um
   modo de falha existe não impede de reintroduzi-lo — o que impede é a
   ferramenta reclamar.
+- **Dois números implausíveis eram dois achados, não dois erros.** `:ets` a 16
+  mil ops/s e `cast` mais lento que `call` pareciam bug de benchmark. Eram
+  contenção de chave única (`write_concurrency` fragmenta **por chave**, e na
+  mesma chave adicionar núcleos deixa 200x mais lento) e falta de contrapressão
+  (a caixa chegou a 811 mil mensagens; `off_heap` rende 254x sob contenção e
+  custa 2,8x sem ela). **Anomalia implausível é informação sobre o sistema** —
+  mas só depois de verificar o instrumento.
+- **O mecanismo mais rápido pode estar errado, e o correto pode custar o
+  mesmo.** Sem coordenação: 32,0 M ops/s e 70% das atualizações perdidas, em
+  silêncio. `AtomicLong`: 31,1 M e nenhuma. Não havia troca a fazer.
+- **O modelo custa o mesmo nas duas plataformas.** `agent` de Clojure e
+  `GenServer` de Elixir fazem 534 mil e 493 mil ops/s — 8% de diferença. A BEAM
+  não é mágica: ela torna esse modelo o caminho padrão em vez de uma biblioteca.
 - **A plataforma mais leve não é a mais barata, e o número de memória era a
   parte menos interessante.** A thread virtual do Loom custa 1.323 bytes contra
   2.732 do processo da BEAM — e **nunca rodou** sob carga de CPU, onde a BEAM
@@ -1111,8 +1275,9 @@ etapa.
 | **Gleam** — codec tipado do protocolo | ✅ 13 testes, conformes aos vetores |
 | **Rust** — codec como NIF | ✅ 9 testes, travessia em ~30 ns (3 execuções, ±3%) |
 | **Scala** — BEAM vs Loom | ✅ 1.323 vs 2.732 bytes/unidade; inanição medida |
+| **Clojure** — contenção | ✅ 5 mecanismos na JVM, 7 na BEAM; 2 patologias achadas |
 | Protocolo verificado em 4 linguagens | ✅ Elixir, Go, Gleam e Rust contra `protocolo/vetores.txt` |
-| Clojure | ⬜ ambiente pronto, não integrado |
+| HCL (OpenTofu) | ⬜ ambiente pronto, não integrado |
 | Distribuição entre nós | ⬜ |
 | NATS, OpenTofu, kind em uso | ⬜ instalados e verificados, não integrados |
 | CI | ⬜ |
