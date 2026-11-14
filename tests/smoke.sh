@@ -23,9 +23,27 @@ bad() { printf '  \033[31mFAIL\033[0m %-18s %s\n' "$1" "${2:-}"; fail=$((fail+1)
 
 check() { # $1 = nome, $2 = esperado, $3.. = comando
     local name=$1 want=$2; shift 2
+    # A saída completa vai para arquivo e a comparação usa a ÚLTIMA linha.
+    #
+    # A primeira versão fazia `$(... 2>&1 | tail -1)` e, nos comandos em que eu
+    # havia posto `2>/dev/null`, a falha aparecia como saída vazia sem motivo
+    # nenhum: o CI reportou "gleam: esperava [42], veio []" e eu não tinha como
+    # saber por quê. Esconder stderr num harness de verificação é o mesmo erro
+    # de redirecionar para /dev/null e não olhar o retorno -- é o quarto caso
+    # dele neste portfólio.
+    local slug out
+    slug=$(printf '%s' "$name" | tr -cd 'A-Za-z0-9_-')
+    out="$TMP/$slug.log"
+    "$@" >"$out" 2>&1
     local got
-    got=$("$@" 2>&1 | tail -1)
-    if [ "$got" = "$want" ]; then ok "$name" "$got"; else bad "$name" "esperava [$want], veio [$got]"; fi
+    got=$(tail -1 "$out")
+    if [ "$got" = "$want" ]; then
+        ok "$name" "$got"
+    else
+        bad "$name" "esperava [$want], veio [$got]"
+        # Sem isto, uma falha no CI é indistinguível de outra.
+        sed 's/^/           | /' "$out" | tail -8
+    fi
 }
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
@@ -44,9 +62,9 @@ main() ->
     Pid ! {Pai, 21},
     receive {ok, R} -> io:format("~p~n", [R]) end.
 ERL
-(cd "$TMP" && erlc ator.erl >/dev/null 2>&1) \
+(cd "$TMP" && erlc ator.erl >"$TMP/erlc.log" 2>&1) \
   && check "erlang" "42" erl -noshell -pa "$TMP" -eval 'ator:main(),halt().' \
-  || bad "erlang" "erlc falhou"
+  || { bad "erlang" "erlc falhou"; sed 's/^/           | /' "$TMP/erlc.log" | tail -5; }
 
 # --- Elixir: supervisor + GenServer. Se isto roda, o OTP esta inteiro, que e
 # a premissa do projeto todo.
@@ -67,7 +85,7 @@ check "elixir (OTP)" "42" elixir "$TMP/otp.exs"
 
 # --- Gleam: tipagem estatica sobre a BEAM. Compila via rebar3.
 if command -v gleam >/dev/null; then
-  (cd "$TMP" && gleam new g --name g >/dev/null 2>&1) && {
+  (cd "$TMP" && gleam new g --name g >"$TMP/gleam-new.log" 2>&1) && {
     cat > "$TMP/g/src/g.gleam" <<'GLE'
 import gleam/io
 import gleam/int
@@ -76,8 +94,8 @@ pub fn main() {
   io.println(int.to_string(21 * 2))
 }
 GLE
-    check "gleam" "42" sh -c "cd '$TMP/g' && gleam run 2>/dev/null"
-  } || bad "gleam" "gleam new falhou"
+    check "gleam" "42" sh -c "cd '$TMP/g' && gleam run"
+  } || { bad "gleam" "gleam new falhou"; sed 's/^/           | /' "$TMP/gleam-new.log" | tail -5; }
 fi
 
 # --- Go: goroutine e canal, que e o motivo de o Go estar no projeto.
@@ -98,9 +116,9 @@ check "go (goroutine)" "42" sh -c "cd '$TMP/go' && go mod init m >/dev/null 2>&1
 # --- Rust
 mkdir -p "$TMP/rs"
 echo 'fn main(){ println!("{}", 21*2); }' > "$TMP/rs/m.rs"
-(cd "$TMP/rs" && rustc -O m.rs -o m 2>/dev/null) \
+(cd "$TMP/rs" && rustc -O m.rs -o m 2>"$TMP/rustc.log") \
   && check "rust" "42" "$TMP/rs/m" \
-  || bad "rust" "rustc falhou"
+  || { bad "rust" "rustc falhou"; sed 's/^/           | /' "$TMP/rustc.log" | tail -5; }
 
 # --- Clojure
 check "clojure" "42" clojure -e '(println (* 21 2))'
@@ -113,7 +131,7 @@ mkdir -p "$TMP/sc"
 cat > "$TMP/sc/M.scala" <<'SCALA'
 @main def run(): Unit = println(21 * 2)
 SCALA
-check "scala 3" "42" sh -c "cd '$TMP/sc' && scala-cli run . 2>/dev/null"
+check "scala 3" "42" sh -c "cd '$TMP/sc' && scala-cli run ."
 fi
 
 # =========================================================== infraestrutura
