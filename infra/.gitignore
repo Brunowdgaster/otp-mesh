@@ -1,0 +1,11 @@
+# Estado do OpenTofu: NÃO vai para o repositório.
+#
+# Ele contém o mapeamento entre a configuração e os recursos reais, e aqui é
+# local e descartável. Num projeto de verdade, estado compartilhado vai para
+# backend remoto com travamento -- commitar o arquivo é o jeito clássico de
+# duas pessoas destruírem o recurso uma da outra.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log

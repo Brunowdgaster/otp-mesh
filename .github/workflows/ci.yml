@@ -173,6 +173,22 @@ jobs:
           # E o STM nao pode ter violacao de invariante entre dois refs.
           grep -qE '^dois refs \(STM\) +1000000 +0$' /tmp/saida.txt             || { echo "STM violou a invariante dos dois contadores"; exit 1; }
 
+  # A infraestrutura e o unico job que nao depende da maquina: as cinco
+  # propriedades verificadas (convergencia, idempotencia, desvio, grafo,
+  # destroy) valem igual em qualquer lugar que tenha Docker. Por isso aqui o
+  # verificador roda INTEIRO, diferente dos jobs de benchmark.
+  infra:
+    runs-on: ubuntu-latest
+    name: infraestrutura em HCL
+    steps:
+      - uses: actions/checkout@v5
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: '1.13.9'
+      - name: 20 asseroes sobre a infraestrutura declarada
+        working-directory: infra
+        run: bash verifica.sh
+
   gleam:
     runs-on: ubuntu-latest
     name: codec em Gleam

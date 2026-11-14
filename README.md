@@ -729,6 +729,130 @@ produção. `:counters` não tem nada disso.
 A escolha é entre vazão e propriedades operacionais, não entre certo e errado —
 que é a mesma forma da conclusão da seção do Scala, chegando por outro caminho.
 
+### HCL e OpenTofu: quatro propriedades, verificadas uma por uma
+
+Os testes de fumaça deste projeto sobem contêineres com `docker run`, e
+funciona. Então a pergunta honesta não é "como se escreve HCL", é **o que o HCL
+acrescenta** — e a resposta não pode ser "elegância".
+
+`infra/main.tf` declara a infraestrutura que os benchmarks consomem: uma rede,
+o NATS, e o gateway **construído do código deste repositório**. E
+`infra/verifica.sh` comprova cinco propriedades por máquina, com 20 asserções.
+O que segue é a saída dele.
+
+#### 1. Convergência
+
+```
+[ok] Resources: 5 added, 0 changed, 0 destroyed
+[ok] contêiner otpmesh-gateway está running (confirmado no Docker, não no estado)
+[ok] gateway responde em /stats (porta 8080)
+[ok] é o gateway deste repositório (nucleo_ligado=false, sem -core)
+```
+
+A terceira linha é a que importa metodologicamente: **o estado do tofu dizer que
+o recurso existe não é verificação** — é a mesma fonte que acabou de criá-lo. O
+script pergunta ao Docker, e depois pergunta ao próprio gateway.
+
+#### 2. Idempotência
+
+```
+[ok] plan: 0 (nenhuma mudança) -- a realidade bate com a configuração
+[ok] segundo apply: 0 added, 0 changed, 0 destroyed
+```
+
+Um script com `docker run` falha na segunda execução por nome já em uso — ou
+precisa de um `docker rm -f` defensivo, que **apaga antes de saber se
+precisava**.
+
+#### 3. Detecção de desvio: o que o script não tem
+
+Quebrando a infraestrutura à mão, de dois jeitos:
+
+```
+[ok] contêiner parado:   plan devolveu 2 -> # docker_container.gateway must be replaced
+[ok] contêiner removido: plan devolveu 2 -> will be created
+[ok] apply reconvergiu: 1 added
+[ok] e voltou a 0 mudanças
+```
+
+Esta é a propriedade que um script shell **não pode ter**: ele não sabe qual era
+o estado desejado, só sabe executar comandos. Não tem com o que comparar.
+
+A ferramenta é `tofu plan -detailed-exitcode`, cujo código de saída é a
+afirmação em forma verificável: **0** = a realidade bate com a configuração,
+**2** = há desvio, **1** = erro. É o que torna isto um teste e não uma
+demonstração.
+
+#### 4. O grafo: a ordem vem das referências
+
+```
+[ok] docker_container.gateway depende de docker_network.mesh
+[ok] docker_container.gateway depende de docker_image.gateway
+[ok] docker_container.nats    depende de docker_network.mesh
+[ok] gateway NÃO depende do NATS -- dependência não inventada
+```
+
+Nenhuma dessas arestas foi declarada: elas existem porque o contêiner **usa** o
+nome da rede e o id da imagem. Trocar a ordem dos blocos no arquivo não muda
+nada.
+
+A última linha é a mais deliberada. O gateway roda sem o NATS, então um
+`depends_on` ali seria **inventar acoplamento** — e deixar o apply mais lento
+sem motivo. O verificador falha se essa aresta aparecer: é uma asserção sobre
+o que *não* deve existir.
+
+#### 5. Destruição completa
+
+```
+[ok] Resources: 5 destroyed
+[ok] rede removida (o recurso que script de limpeza esquece)
+[ok] imagem do NATS preservada (keep_locally = true, deliberado)
+[ok] contagem de redes caiu de 5 para 4
+```
+
+Script de limpeza esquece recursos conforme a configuração cresce — e redes e
+volumes são os primeiros. O `destroy` remove o que criou, e a última asserção
+confirma pela contagem global, não pelo estado.
+
+E a imagem do NATS **sobrevive de propósito** (`keep_locally = true`): baixá-la
+de novo a cada ciclo de teste é desperdício de rede, e ela não é um recurso que
+este módulo criou.
+
+#### Três decisões que valem mais que a sintaxe
+
+**OpenTofu, não Terraform.** O Terraform passou para **BUSL** em agosto de 2023,
+que proíbe uso em produto concorrente e **não é open source** pela definição da
+OSI. O OpenTofu é o fork sob **MPL-2.0**, mantido pela Linux Foundation. O
+requisito deste projeto era "nenhum recurso pago e nenhuma licença restritiva",
+e BUSL não passa — mesma decisão que levou a NATS (Apache-2.0) em vez de
+Redpanda (BUSL). Os dois leem HCL idêntico, então a linguagem demonstrada é a
+mesma.
+
+**A imagem final é `scratch`: 8,63 MB.** Nenhum sistema operacional, nenhum
+shell, nenhuma biblioteca compartilhada — possível porque o projeto não tem
+dependência externa e o binário é estático (`CGO_ENABLED=0`). E isso não é
+enxugar por esporte: **o RSS do contêiner passa a ser o do gateway**. Numa
+imagem com distro por baixo, os 7,1 KiB por conexão medidos viriam contaminados
+pelo que mais estivesse rodando ali.
+
+**`triggers` na imagem, ou o apply usa código velho.** Sem o `sha1` dos fontes,
+o tofu consideraria a imagem inalterada e subiria uma versão antiga do gateway.
+É o tipo de erro que custa uma hora depurando o bug errado — o programa em
+execução não é o programa que você editou.
+
+#### Duas armadilhas pagas no caminho
+
+**O provider `kreuzwerker/docker` 3.x não instala pelo registro do OpenTofu.**
+`tofu init` recusa com *"the provider is not signed with a valid signing key;
+authentication signature from unknown issuer"*. É problema de assinatura no
+registro, não do código, e a série 4.x resolve. Está anotado no `main.tf` para
+quem tentar fixar numa 3.x.
+
+**O estado não vai para o repositório.** `.tfstate` está no `.gitignore` porque
+ele mapeia configuração a recursos reais. Aqui é local e descartável; num
+projeto de verdade vai para backend remoto com travamento — commitar o arquivo
+é o jeito clássico de duas pessoas destruírem o recurso uma da outra.
+
 ### O gateway em Go: quanto custa um socket de verdade
 
 O núcleo mediu 3,8 KB por conexão — mas aquelas conexões são processos BEAM
@@ -933,6 +1057,12 @@ cd ../../clojure/contencao
 clojure contencao.clj 8 200000            # 5 mecanismos, um deles ERRADO
 cd ../../elixir/mesh
 mix run bench/contencao.exs 8 200000      # 7 mecanismos da BEAM
+
+# Infraestrutura declarada, e as 20 asserções que a comprovam.
+cd ../../infra
+tofu init && tofu apply      # rede + NATS + gateway construído do fonte
+bash verifica.sh             # convergência, idempotência, desvio, grafo, destroy
+tofu destroy
 ```
 
 O benchmark para sozinho ao passar de 2 GB no BEAM. O limite é deliberado:
@@ -982,6 +1112,7 @@ Três decisões estruturais:
 |---|---|---|---|
 | **Go 1.26** | gateway WebSocket, gerador de carga | Uma goroutine por conexão é o par natural de um processo por conexão, e o `net/http` com `Hijacker` dá o socket cru sem intermediário. É também a comparação que o projeto quer: a plataforma onde "um por conexão" é barato **sem** supervisão nem isolamento de falha | **Node.js**: um laço de eventos, não um por conexão — mediria outra coisa. **Rust**: mais rápido e sem GC, mas `async` exige escolher runtime, e aí a medição seria do Tokio |
 | **`ws/` escrito à mão** (zero dependências) | aperto de mão e quadros da RFC 6455 | O custo por conexão é dominado pelos buffers, e em biblioteca eles são escolha dela. Com `ws.Config` explícito, a tabela de efeito dos buffers existe — e ela mostra +35 % para o padrão herdado | **gorilla/websocket**, **coder/websocket**: ambas boas e livres; esconderiam justamente a variável sob medição |
+| **HCL + OpenTofu 1.13** | `infra/`, a infraestrutura dos benchmarks | Declara rede, NATS e o gateway construído do fonte. Existe para responder **o que o HCL acrescenta a um `docker run`**, com cinco propriedades verificadas por máquina em `verifica.sh`: convergência, idempotência, detecção de desvio, grafo derivado de referências, e destruição completa. A chave é `plan -detailed-exitcode`, que transforma "detecta desvio" em código de saída | **Terraform**: passou para BUSL em 2023, que não é open source pela OSI. OpenTofu é o fork MPL-2.0 da Linux Foundation e lê o mesmo HCL. Mesma decisão que levou a NATS em vez de Redpanda |
 | **Clojure 1.12** | `clojure/contencao`, contenção em estado compartilhado | O `Mesh.Stats` serializa contadores por caixa de mensagens; Clojure oferece quatro coordenações alternativas (atom, ref/STM, agent, mais o `AtomicLong` do JDK) e medi-las diz o que o padrão da BEAM custa e compra. Achou que `agent` e `GenServer` **empatam** (534 k contra 493 k), que `:counters` bate `AtomicLong` por 3,4x, e que a versão sem coordenação é a mais rápida **e perde 70% das atualizações** | **core.async**: traria seu próprio escalonador e mediria a biblioteca, não a linguagem. Atom, ref e agent são todos de `clojure.core` — o projeto segue sem dependências |
 | **Scala 3.10 + JDK 25** | `scala/loadgen`, custo e escalonamento da concorrência | Loom promete o que a BEAM promete — "crie uma por conexão" — e a comparação direta é o que dá sentido aos 3.534 bytes do projeto. Resultado: a thread virtual é **mais barata** (1.323 contra 2.732 bytes) e **sofre inanição completa** sob carga de CPU, onde a BEAM degrada 21x. Mede também o muro da thread de plataforma: 30.568 e OOM | **Akka/Pekko ou Cats Effect**: trariam seu próprio escalonador e mediriam a biblioteca, não a plataforma. O JDK tem `Thread.ofVirtual` e cliente WebSocket embutidos, então o projeto segue sem dependências |
 | **Rust 1.93 + rustler** | `native/mesh_nif`, codec como NIF | Existe para **medir o custo da travessia** BEAM↔nativo, que é a decisão que todo projeto BEAM enfrenta e quase ninguém mede. Resultado: ~30 ns por chamada, e o NIF não venceu acima do ruído em nenhum tamanho até 1 MiB | **NIF à mão contra a ABI do `erl_nif.h`**: dezenas de linhas de `unsafe extern "C"` e conversão manual de termos — mediria a qualidade do meu boilerplate, não o custo real. `rustler` é o que se usaria de verdade |
@@ -1171,6 +1302,11 @@ etapa.
   devolvia medição não convergida em silêncio, como o do P01. Saber que um
   modo de falha existe não impede de reintroduzi-lo — o que impede é a
   ferramenta reclamar.
+- **"O que isto acrescenta?" é uma pergunta melhor que "como se escreve
+  isto?".** A seção do HCL não existe para mostrar sintaxe: existe porque
+  `docker run` já funcionava, e a diferença tinha de ser demonstrada. Virou
+  `plan -detailed-exitcode` e 20 asserções — inclusive uma sobre uma
+  dependência que **não** deve existir.
 - **Dois números implausíveis eram dois achados, não dois erros.** `:ets` a 16
   mil ops/s e `cast` mais lento que `call` pareciam bug de benchmark. Eram
   contenção de chave única (`write_concurrency` fragmenta **por chave**, e na
@@ -1276,8 +1412,9 @@ etapa.
 | **Rust** — codec como NIF | ✅ 9 testes, travessia em ~30 ns (3 execuções, ±3%) |
 | **Scala** — BEAM vs Loom | ✅ 1.323 vs 2.732 bytes/unidade; inanição medida |
 | **Clojure** — contenção | ✅ 5 mecanismos na JVM, 7 na BEAM; 2 patologias achadas |
+| **HCL** — infraestrutura declarada | ✅ 20 asserções em `infra/verifica.sh` |
 | Protocolo verificado em 4 linguagens | ✅ Elixir, Go, Gleam e Rust contra `protocolo/vetores.txt` |
-| HCL (OpenTofu) | ⬜ ambiente pronto, não integrado |
+| **Todas as 7 linguagens do plano** | ✅ integradas e no CI |
 | Distribuição entre nós | ⬜ |
 | NATS, OpenTofu, kind em uso | ⬜ instalados e verificados, não integrados |
 | CI | ⬜ |
