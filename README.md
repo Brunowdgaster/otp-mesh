@@ -275,6 +275,18 @@ ficou instalado** em vez de confiar no instalador.
 É também a defesa do teste de fumaça existir: um `setup.sh` que se auto-declara
 bem-sucedido não é verificação.
 
+E, corrigido o silêncio, apareceu a causa de baixo: o script checava `dpkg -s
+docker.io` e `dpkg -s golang-go`, mas o runner do GitHub **já tem** `docker` e
+`go` por outros pacotes (`moby-engine` e o tarball oficial do Go), e o apt
+recusava instalar os do Debian por cima — `pkgProblemResolver::Resolve
+generated breaks`.
+
+A correção é conceitual: **verificar a capacidade, não a identidade do
+pacote**. O que importa é `docker` e `go` funcionarem, não qual pacote os
+forneceu. Hoje o script checa `command -v` para cada ferramenta e só instala o
+que falta — o que conserta o runner e vale para qualquer máquina que já tenha
+as ferramentas por outro caminho.
+
 ### Por que o benchmark para em 2 GB
 
 Não é timidez: é que o OOM killer do Linux, acionado por um benchmark, não mata

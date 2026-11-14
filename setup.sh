@@ -61,10 +61,25 @@ fetch_bin() {  # $1 = url, $2 = nome do binário no destino
 
 # ---------------------------------------------------------------- pacotes apt
 say "1. Pacotes do apt (livres, nos repositórios do Ubuntu)"
-APT_PKGS="erlang elixir golang-go openjdk-21-jdk docker.io clojure rebar3 curl unzip"
+
+# O mapa é `comando:pacote`, e a verificação é pelo COMANDO, não pelo nome do
+# pacote.
+#
+# A primeira versão checava `dpkg -s docker.io` e `dpkg -s golang-go`. Num
+# runner do GitHub, `docker` e `go` já existem — instalados por `moby-engine` e
+# pelo tarball oficial do Go — então o script tentava instalar os pacotes do
+# Debian por cima e o apt recusava com
+# "pkgProblemResolver::Resolve generated breaks".
+#
+# O que importa é a ferramenta funcionar, não qual pacote a forneceu. Checar
+# capacidade em vez de identidade de pacote conserta o runner e é mais correto
+# em qualquer máquina que já tenha as ferramentas por outro caminho.
+APT_MAP="erl:erlang elixir:elixir go:golang-go java:openjdk-21-jdk docker:docker.io clojure:clojure rebar3:rebar3 curl:curl unzip:unzip"
 MISSING=""
-for p in $APT_PKGS; do
-    dpkg -s "$p" >/dev/null 2>&1 || MISSING="$MISSING $p"
+for entry in $APT_MAP; do
+    cmd=${entry%%:*}
+    pkg=${entry##*:}
+    have "$cmd" || MISSING="$MISSING $pkg"
 done
 if [ -n "$MISSING" ]; then
     if [ "$CHECK_ONLY" = 1 ]; then
@@ -95,13 +110,15 @@ if [ -n "$MISSING" ]; then
             exit 1
         fi
 
-        # Confere o que de fato ficou instalado, em vez de confiar no instalador.
+        # Confere o que de fato ficou utilizável, em vez de confiar no
+        # instalador -- e pelo comando, pelo mesmo motivo da checagem acima.
         ainda_falta=""
-        for p in $MISSING; do
-            dpkg -s "$p" >/dev/null 2>&1 || ainda_falta="$ainda_falta $p"
+        for entry in $APT_MAP; do
+            cmd=${entry%%:*}
+            have "$cmd" || ainda_falta="$ainda_falta $cmd"
         done
         if [ -n "$ainda_falta" ]; then
-            echo "  ERRO: apt disse que instalou, mas falta:$ainda_falta" >&2
+            echo "  ERRO: apt disse que instalou, mas estes comandos nao existem:$ainda_falta" >&2
             exit 1
         fi
         echo "  instalados e conferidos"
