@@ -156,17 +156,32 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '21'
-      - name: instalar clojure
+      # Instalacao OFICIAL, e nao `apt-get install clojure`.
+      #
+      # O pacote do apt funcionava e parou: a imagem do runner virou Ubuntu
+      # 26.04 e o `clojure` saiu dos repositorios -- "E: Unable to locate
+      # package clojure". Depender de pacote de distribuicao para a toolchain
+      # principal de um job e depender de decisao de empacotador.
+      #
+      # ATENCAO a diferenca de invocacao, que custou uma depuracao:
+      #
+      #   * CLI oficial       : `clojure -M script.clj args`
+      #   * pacote do Debian  : `clojure script.clj args`  (nao aceita -M)
+      #
+      # Local usa o pacote do Debian; aqui usa o oficial. Por isso o comando
+      # abaixo tem o `-M` e o README nao.
+      - name: instalar clojure (CLI oficial)
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y clojure
-          clojure -e '(println "clojure" (clojure-version))'
+          curl -sSL -O https://download.clojure.org/install/linux-install.sh
+          chmod +x linux-install.sh
+          sudo ./linux-install.sh
+          clojure -M -e '(println "clojure" (clojure-version))'
       - name: contencao, e o sem-coordenacao perdendo atualizacoes
         working-directory: clojure/contencao
         run: |
           set -euo pipefail
-          clojure contencao.clj 4 50000 | tee /tmp/saida.txt
+          clojure -M contencao.clj 4 50000 | tee /tmp/saida.txt
           # Os quatro mecanismos coordenados tem de contar certo.
           corretos=$(grep -cE '^(AtomicLong|atom|ref|agent).*sim$' /tmp/saida.txt)
           test "$corretos" -eq 4 || { echo "esperava 4 corretos, achei $corretos"; exit 1; }
