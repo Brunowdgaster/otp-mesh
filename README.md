@@ -659,16 +659,40 @@ separa é contenção. E 6.623x de diferença entre o primeiro e o último.
 
 | modelo | JVM / Clojure | BEAM | quem ganha |
 |---|---|---|---|
-| contador sem bloqueio | `AtomicLong` 31,1 M | `:counters` **106,4 M** | BEAM, 3,4x |
+| contador sem bloqueio | `AtomicLong` | `:counters` | **BEAM, 1,19x a 2,97x** |
 | CAS sobre valor imutável | `atom` 6,4 M | `:atomics` 32,1 M | BEAM, 5x |
 | **fila + guardião** | `agent` ~0,5 M | `GenServer` call ~0,5 M | **não determinado** |
 | transação multi-referência | `ref` (STM) 62 k | — | só a JVM tem |
 
 Duas leituras:
 
-**`:counters` da BEAM bate o `AtomicLong` por 3,4x** porque não é uma palavra
-única: com `write_concurrency` ele é fragmentado por escalonador, então não há
-linha de cache disputada. O `AtomicLong` é uma palavra e paga o *bouncing*.
+**O `:counters` da BEAM bate o `AtomicLong`**, e a explicação é a estratégia:
+com `write_concurrency` ele é fragmentado por escalonador e somado na leitura,
+então não há linha de cache disputada. O `AtomicLong` é uma palavra única e paga
+o *bouncing* entre núcleos.
+
+Medido por `bench/contador_cruzado.sh`, 7 repetições **alternadas** entre as
+plataformas, com a máquina calibrada antes e depois:
+
+| | faixa das amostras | dispersão |
+|---|---|---|
+| JVM `AtomicLong` | 12,4 M – 40,7 M ops/s | 229% |
+| BEAM `:counters` | 48,4 M – 120,9 M ops/s | 150% |
+
+A dispersão é enorme nos dois lados, mas **as faixas não se tocam**: a pior
+amostra do `:counters` supera a melhor do `AtomicLong`. Então o resultado é
+decidido, e o fator honesto é um intervalo:
+
+* **1,19x** — limite conservador (pior do vencedor ÷ melhor do perdedor);
+* **2,97x** — pelos melhores de cada lado.
+
+> **Correção.** A primeira versão desta seção publicou **3,4x**, medido em
+> processos e momentos distintos, sem alternância, com carga de fundo na
+> máquina. O número não se sustentou; a explicação sim.
+>
+> E a ressalva que faltava: com **8 trabalhadores em 4 núcleos físicos**, a
+> fragmentação tem onde render. Com 1 trabalhador a comparação provavelmente
+> inverte — e isso **não foi medido**.
 
 **O `agent` e o `GenServer` ficam na mesma ordem de grandeza** — ambos em torno
 de 0,5 M ops/s, contra 106 M do `:counters` e 62 mil do STM. Os dois são "uma
@@ -683,8 +707,9 @@ caminho padrão em vez de uma biblioteca.
 > na máquina durante parte da sessão.
 >
 > `bench/fila_cruzada.sh` refez a medição alternando as plataformas a cada
-> repetição. Resultado: **razão de 1,248x, com dispersão de 57,6% e 123,0%** —
-> a margem não supera o ruído, e o veredito é **não determinado**.
+> repetição: **faixas de 437–634 mil e 370–522 mil ops/s**, que **se
+> sobrepõem**, com margem de 21,4% contra dispersão de 45,0%. Veredito: **não
+> determinado**.
 >
 > A substância sobrevive (as duas estão na mesma ordem de grandeza, e muito
 > longe dos extremos da tabela), mas a afirmação precisa era inventada. A
@@ -1366,6 +1391,19 @@ etapa.
 - **O mecanismo mais rápido pode estar errado, e o correto pode custar o
   mesmo.** Sem coordenação: 32,0 M ops/s e 70% das atualizações perdidas, em
   silêncio. `AtomicLong`: 31,1 M e nenhuma. Não havia troca a fazer.
+- **O instrumento decidia errado nos dois sentidos, e consertar isso mudou uma
+  conclusão.** A regra "margem dos mínimos contra dispersão" declarava "não
+  determinado" para o par `AtomicLong` × `:counters`, cujas faixas de amostra
+  **não se tocam** — a pior do vencedor supera a melhor do perdedor. Dispersão
+  alta não importa quando as faixas são disjuntas. A regra nova decide esse par
+  (1,19x a 2,97x) e **mantém** o outro como não determinado: um instrumento que
+  decidisse tudo seria tão inútil quanto um que não decidisse nada.
+- **`/proc/loadavg` não serve de porteiro em WSL2, e isso foi medido.** Com 4
+  núcleos do **Windows** ocupados, o laço fixo de calibração inflou **74%**
+  (183 → 319 ms) enquanto o `loadavg` do WSL2 mal se moveu, porque processos do
+  Windows não aparecem no `/proc` do Linux. `bench/calibra.sh` detecta por
+  tempo, que atravessa a fronteira da VM — e roda **antes e depois** de cada
+  medição, porque carga que aparece no meio é o caso que mais importa.
 - **"Empatam em 8%" era um número inventado, e eu mesmo tinha a regra que o
   proibia.** Publiquei que `agent` e `GenServer` empatavam com 8% de diferença,
   medindo-os em processos e momentos distintos, sem alternância — o erro que

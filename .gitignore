@@ -21,3 +21,7 @@ elixir/mesh/priv/native/
 # scala-cli
 scala/*/.scala-build/
 scala/*/.bsp/
+
+# Linha de base da calibracao: e desta MAQUINA, nao do repositorio.
+# O numero de outra maquina daria falso alarme ou, pior, falso OK.
+bench/.calibracao
