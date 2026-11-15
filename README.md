@@ -24,11 +24,17 @@ conexões      abrir (ms)   BEAM (MB)  bytes/conn  broadcast (ms)
 === Caos com 700000 conexões abertas ===
   mortas                : 210000 de 700000
   vivas depois          : 490000  (esperado 490000)
-  convergência          : 8914 ms
+  convergência          : 8914 ms     (amostra; ver a auditoria)
   supervisor sobreviveu : true
-  Stats reiniciou em    : 5.83 ms
+  Stats reiniciou em    : 5.83 ms      (amostra; ver a auditoria)
   contagem após reinício: 490000 (relida do Registry)
 ```
+
+> Os dois tempos acima são de **execução única**. A auditoria os refez com
+> repetições e achou dispersão de 155% e 94% — ver
+> [o caos](#o-caos-a-árvore-aguenta) e
+> [`docs/AUDITORIA.md`](docs/AUDITORIA.md). Os **números de memória e de
+> contagem** desta saída não dependem disso.
 
 > **Status:** o **núcleo em Elixir/OTP, o gateway em Go e a ponte entre os
 > dois** estão completos e medidos — 500 WebSockets reais viram 500 processos
@@ -87,11 +93,61 @@ Com 700 mil conexões abertas, matando 210 mil de uma vez com
 `Process.exit(pid, :kill)`:
 
 - **O supervisor é o mesmo processo depois do massacre.** Não foi derrubado.
-- A contagem converge para exatamente 490.000 — o `Registry` limpa cada entrada
-  ao receber o `:DOWN` do processo morto, e isso levou 8,9 s para 210 mil.
-- O `Mesh.Stats`, que é `:permanent`, foi morto separadamente e **voltou em
-  5,83 ms com a contagem correta** — porque a contagem é *relida do Registry*,
-  não restaurada de um backup.
+- A contagem converge para exatamente 490.000 — o `Registry` limpa cada
+  entrada ao receber o `:DOWN` do processo morto.
+- O `Mesh.Stats`, que é `:permanent`, foi morto separadamente e **voltou com a
+  contagem correta** — porque a contagem é *relida do Registry*, não restaurada
+  de um backup.
+
+#### Os dois tempos, refeitos com repetições
+
+A primeira versão desta seção publicou **8,9 s** de convergência e **5,83 ms**
+de reinício, os dois de **execução única**. `bench/caos.exs` repete, matando
+60 mil de 200 mil por repetição e **reabrindo entre elas** para que cada uma
+comece da mesma população:
+
+| | faixa medida | dispersão |
+|---|---|---|
+| convergência (60 mil mortes) | 1.806 – 4.610 ms | **155%** |
+| reinício do `Stats` | 19,15 – 37,09 ms | **94%** |
+
+**A convergência:** por morte, isso dá 30 a 77 µs. O número publicado
+(8,9 s / 210 mil = 42 µs por morte) cai no meio da faixa — era plausível, mas
+era uma amostra. E há uma estrutura dentro da dispersão: a **primeira
+repetição é sempre ~2,5x mais lenta** (4.610 → 2.561 → 1.871 → 1.806 ms), o
+que é aquecimento, não ruído.
+
+**O reinício do `Stats` é o caso mais interessante da auditoria**, porque o
+número original não estava errado — estava **condicional**, e a condição não
+foi declarada:
+
+| contexto | reinício |
+|---|---|
+| sistema quieto, 200 mil conexões ociosas | **6,0 – 6,7 ms** |
+| depois de 4 rodadas matando 60 mil cada | **19,2 – 37,1 ms** |
+
+Os 5,83 ms publicados eram reprodutíveis **nas condições deles**. Sob agitação,
+o mesmo reinício custa 3x a 6x mais — o supervisor precisa notar o `:DOWN` e
+iniciar o filho num nó com 140 mil processos e rotatividade recente. O fato
+qualitativo (volta em **milissegundos**, com estado reconstruído) sobrevive nos
+dois contextos.
+
+#### E o benchmark bateu na intensidade de reinício
+
+A primeira versão de `bench/caos.exs` matava o `Stats` 9 vezes com 120 ms de
+intervalo. Resultado: `{:error, :nao_voltou}` e, na iteração seguinte,
+`Process.exit(nil, :kill)`.
+
+A causa é o `Supervisor.start_link(children, strategy: :one_for_one)` da
+`Mesh.Application`, **sem `max_restarts`** — vale o padrão do OTP, **3
+reinícios em 5 segundos**. Estourado o limite, o supervisor desiste e derruba a
+árvore.
+
+Ou seja: o benchmark acionou **o mecanismo que a próxima seção deste README
+descreve**, e levou a árvore abaixo por fazer exatamente o que aquela seção diz
+para não fazer. A medição agora espaça as mortes em 5,2 s e confere que o
+supervisor está vivo antes de cada uma, falhando com o motivo em vez de estourar
+com "not a pid" três quadros de pilha abaixo.
 
 ### O erro de OTP que este projeto existe para não cometer
 
@@ -491,11 +547,15 @@ fronteira. `:erlang.memory` enxerga o heap da BEAM e **não enxerga** pilhas de
 threads do sistema operacional — medir a JVM assim daria ~0 bytes por thread de
 plataforma, que é exatamente a conclusão errada.
 
-| primitivo | criados | **bytes por unidade (RSS)** | criação/s |
-|---|---|---|---|
-| thread de plataforma | **30.568, então OOM** | 23.502 | 702 |
-| processo da BEAM | 700.000 | **2.732** | **122.079** |
-| thread virtual (Loom) | 700.000 | **1.323** | 38.015 |
+| primitivo | criados | **bytes por unidade (RSS)** |
+|---|---|---|
+| thread de plataforma | **30.568, então OOM** | 23.502 |
+| processo da BEAM | 700.000 | **2.732** |
+| thread virtual (Loom) | 700.000 | **1.323** |
+
+A coluna de **taxa de criação** saiu desta tabela e virou uma medição própria
+(`bench/concorrencia_cruzada.sh`), porque aqui ela estava errada em dois
+sentidos — ver abaixo.
 
 Três resultados, em ordem de surpresa:
 
@@ -514,7 +574,29 @@ justifica Loom ter sido criado.
 bytes, quase a metade. Esse é o resultado que contraria o senso comum, e ele é
 real.
 
-**A BEAM cria 3,2x mais rápido** — 122 mil por segundo contra 38 mil.
+**A BEAM cria entre 3,07x e 5,32x mais rápido.**
+
+Este número foi **refeito na auditoria**, e a primeira versão tinha dois
+defeitos. O primeiro é o de sempre: medição em processos e momentos distintos,
+sem alternância. O segundo é pior e específico desta comparação — ela foi feita
+com **700 mil unidades dos dois lados**, onde a BEAM ocupa ~1,9 GiB e o Loom
+~930 MiB numa máquina com 3,8 GiB. **Os dois lados não estavam sob a mesma
+pressão de memória**, e isso entra na taxa.
+
+Refeito em 200 mil (folga nos dois lados), 7 repetições **alternadas**, com a
+máquina calibrada antes e depois:
+
+| | faixa das amostras | dispersão |
+|---|---|---|
+| processo da BEAM | 96.525 – 167.364 /s | 73,4% |
+| thread virtual | 24.916 – 31.451 /s | 26,2% |
+
+**As faixas não se tocam**: a pior amostra da BEAM supera a melhor do Loom.
+Fator conservador **3,07x**, pelos melhores **5,32x**.
+
+> A correção **fortalece** a afirmação: o "3,2x" publicado antes caiu
+> exatamente no limite conservador do intervalo real. E a **capacidade** de 700
+> mil unidades de cada lado continua válida — é contagem, não tempo.
 
 #### Por que a thread virtual é mais barata: ela compra menos
 
@@ -542,9 +624,25 @@ alta: é inanição. Ela esperaria os laços terminarem.
 Em um servidor, essa é a diferença entre *"uma requisição pesada deixa as outras
 lentas"* e *"uma requisição pesada trava as outras"*.
 
-E note a primeira coluna: sem carga nenhuma, a BEAM atende em 0,008 ms contra
-0,318 ms — **40x mais rápido** para criar e escalonar uma unidade de
-concorrência.
+E note a primeira coluna: **sem carga nenhuma, a BEAM atende entre 12x e 36x
+mais rápido.**
+
+Refeito na auditoria pelo mesmo motivo da taxa de criação — a versão original
+(0,008 ms contra 0,318 ms, "40x") veio de execuções únicas sem alternância.
+Com 7 repetições alternadas:
+
+| | faixa das amostras | dispersão |
+|---|---|---|
+| processo da BEAM | 2 – 6 µs | 200% |
+| thread virtual | 72 – 371 µs | 415% |
+
+A dispersão é altíssima nos dois lados — são números de microssegundos, perto
+da granularidade do relógio. Mas **as faixas não se tocam**: a pior amostra da
+BEAM (6 µs) ainda é menor que a melhor do Loom (72 µs). Fator conservador
+**12x**, pelos melhores **36x**.
+
+Os "40x" publicados antes eram levemente otimistas: o melhor caso medido agora
+é 36x.
 
 #### Sendo justo com Loom
 
@@ -642,18 +740,43 @@ contador é desperdício.
 
 #### Lado da BEAM (`bench/contencao.exs`)
 
-| mecanismo | ops/s | correto? |
-|---|---|---|
-| `:counters` | **106.354.693** | sim |
-| `:atomics` | 32.149.172 | sim |
-| `:ets`, 1 chave por worker | 32.136.258 | sim |
-| `GenServer` cast `off_heap` | 4.304.547 | sim |
-| `GenServer` call | 492.567 | sim |
-| `GenServer` cast (on-heap) | **17.106** | sim |
-| `:ets`, 1 chave só | **16.057** | sim |
+Refeita na auditoria com **3 repetições por mecanismo**, melhor vazão e
+dispersão ao lado — a primeira versão media **uma vez** cada um:
+
+| mecanismo | ops/s | dispersão | correto? |
+|---|---|---|---|
+| `:counters` | **53.045.122** | 7,2% | sim |
+| `:atomics` | 32.630.420 | **113,9%** | sim |
+| `:ets`, 1 chave por worker | 15.586.035 | 22,1% | sim |
+| `GenServer` cast `off_heap` | 3.518.084 | 4,8% | sim |
+| `GenServer` call | 488.031 | 27,1% | sim |
+| `GenServer` cast (on-heap) | 52.879 | **164,1%** | sim |
+| `:ets`, 1 chave só | **17.088** | 4,5% | sim |
 
 **Todos contam certo.** Correção não é o que separa estes mecanismos — o que
-separa é contenção. E 6.623x de diferença entre o primeiro e o último.
+separa é contenção, e **três ordens de grandeza** entre o primeiro e o último.
+
+> **Correção.** Três linhas mudaram muito em relação à versão de execução única:
+>
+> | | antes | agora |
+> |---|---|---|
+> | `:counters` | 106.354.693 | **53.045.122** |
+> | `:ets`, 1 chave/worker | 32.136.258 | **15.586.035** |
+> | `GenServer` cast | 17.106 | **52.879** |
+>
+> As três eram amostras, não medidas. E duas afirmações que a tabela antiga
+> autorizava **morreram**:
+>
+> * *"`:atomics` empata com `:ets` de uma chave por worker"* — agora estão a
+>   2,1x, mas a dispersão do `:atomics` é de 113,9%, então as faixas se
+>   sobrepõem e o par é **não determinado**;
+> * os multiplicadores exatos de 1.400x (ETS) e 254x (`off_heap`) — ver as
+>   duas seções abaixo.
+>
+> Note também **quais** mecanismos têm dispersão alta: `:atomics` (113,9%) e
+> `cast` on-heap (164,1%). Os dois são justamente os que disputam recurso
+> compartilhado sem fragmentação — a instabilidade é da contenção, não do
+> relógio.
 
 #### Comparando as duas plataformas
 
@@ -695,7 +818,7 @@ decidido, e o fator honesto é um intervalo:
 > inverte — e isso **não foi medido**.
 
 **O `agent` e o `GenServer` ficam na mesma ordem de grandeza** — ambos em torno
-de 0,5 M ops/s, contra 106 M do `:counters` e 62 mil do STM. Os dois são "uma
+de 0,5 M ops/s, contra 53 M do `:counters` e 62 mil do STM. Os dois são "uma
 fila, um guardião, escritas serializadas", e o modelo cobra um preço parecido
 nas duas plataformas. A BEAM não é mágica aqui; ela só torna esse modelo o
 caminho padrão em vez de uma biblioteca.
@@ -734,9 +857,15 @@ Variando o número de trabalhadores com o total fixo em 1,6 milhão:
 | 4 | **93.238** | 8.098.846 |
 | 8 | **17.012** | **24.122.543** |
 
-A mesma tabela, a mesma opção, **1.400x de diferença** — só pela distribuição
-das chaves. Na coluna da esquerda, *adicionar núcleos deixa 200x mais lento*: os
-escalonadores disputam a mesma linha de cache.
+A mesma tabela, a mesma opção, **três ordens de grandeza de diferença** — só
+pela distribuição das chaves. Na coluna da esquerda, *adicionar núcleos deixa
+200x mais lento*: os escalonadores disputam a mesma linha de cache.
+
+> **Correção de precisão.** A rampa acima é de **execução única**, e a primeira
+> versão desta seção publicou "1.400x". A medição com repetições deu
+> 15.586.035 contra 17.088, ou **912x**. O fato — fragmentação por chave muda a
+> vazão em três ordens de grandeza — é robusto; o multiplicador exato não é, e
+> a rampa continua aqui como *forma da curva*, não como números finos.
 
 E o único jeito de ver isso é **variar o número de trabalhadores**. Com uma
 medição só, o número parece simplesmente "ruim" e a causa fica invisível.
@@ -750,8 +879,15 @@ coleta de lixo varre a fila inteira, repetidamente.
 | cast, caixa no heap | 3.457.650 | **17.906** |
 | cast, `message_queue_data: :off_heap` | 1.236.938 | **4.544.460** |
 
-Sob contenção, `off_heap` rende **254x**. Com um trabalhador só, fica **2,8x mais
-lento** — a opção não é gratuita: troca varredura de GC por alocação.
+Sob contenção, `off_heap` rende **~66x** (3.518.084 contra 52.879 na medição
+com repetições). Com um trabalhador só, fica **2,8x mais lento** — a opção não é
+gratuita: troca varredura de GC por alocação.
+
+> **Correção de precisão.** A primeira versão publicou **254x**, de execuções
+> únicas. Com 3 repetições o fator é ~66x — e note que o `cast` on-heap tem
+> **164,1% de dispersão**, que é a assinatura da própria patologia: uma caixa
+> que cresce sem limite não produz tempo repetível. O número exato não está
+> estabelecido; a ordem de grandeza e a causa, sim.
 
 E o `call` é mais lento por operação mas **auto-limitado**: cada remetente espera
 a resposta, então a caixa nunca cresce. **`call` dá contrapressão de graça;
@@ -1064,6 +1200,48 @@ Quanto maior depende de `sysctl`, e medir isso exige ler
 espaço do processo", não "7,1 KB no sistema" — e a diferença está declarada
 na própria saída de `/stats`.
 
+## Auditoria das medições
+
+Parte das medições de sessões anteriores rodou com **carga de fundo na
+máquina** — um jogo e um navegador abertos no Windows, que o `/proc/loadavg` do
+WSL2 não vê. Ao descobrir isso, revisei **toda** afirmação numérica deste
+README contra as regras de medição do repositório.
+
+**[`docs/AUDITORIA.md`](docs/AUDITORIA.md)** tem a revisão completa: cada
+afirmação, o método com que foi obtida, e o motivo de ser robusta ou frágil.
+Resumo:
+
+| categoria | quantas | por quê |
+|---|---|---|
+| memória e correção | 10 | carga de fundo não muda contagem de bytes nem se um contador fechou |
+| efeito grande (≫ dispersão) | 5 | três ordens de grandeza não viram ruído |
+| método já correto | 3 | alternadas, com dispersão reportada |
+| **corrigidas** | **7** | sem alternância, ou em execução única |
+
+As sete correções estão marcadas no texto, cada uma com o número antigo, o
+novo, e o defeito de método:
+
+| afirmação | antes | depois |
+|---|---|---|
+| `agent` × `GenServer` | "empatam, 8%" | **não determinado** |
+| `:counters` × `AtomicLong` | 3,4x | **1,19x a 2,97x** |
+| taxa de criação BEAM × Loom | 3,2x | **3,07x a 5,32x** |
+| latência sem carga | 40x | **12x a 36x** |
+| tabela de contenção | 7 valores de execução única | **3 repetições, com dispersão** |
+| convergência do caos | 8,9 s | **1,8 – 4,6 s**, disp. 155% |
+| reinício do `Stats` | 5,83 ms | **condicional**: 6 ms quieto, 19–37 ms sob agitação |
+
+**Nenhuma inverteu uma conclusão qualitativa.** Mas quatro mudaram o número,
+uma virou *não determinado*, uma ficou **mais forte** do que eu havia
+publicado, e uma revelou que o número original estava **certo para a condição
+em que foi medido** — e a condição não estava declarada.
+
+E a auditoria rendeu três melhorias no instrumento, descritas lá:
+`bench/calibra.sh` (detecta máquina ocupada por tempo de laço fixo, porque o
+`loadavg` não serve em WSL2), o modo `--esperar` (distingue "meu benchmark
+aqueceu a CPU" de "há carga externa") e a **regra de sobreposição de faixas**,
+que decide quando a pior amostra do vencedor supera a melhor do perdedor.
+
 ## Ambiente: zero recursos pagos
 
 Todas as 14 ferramentas são software livre, nenhuma exige conta, cartão ou
@@ -1181,7 +1359,7 @@ Três decisões estruturais:
 | **Go 1.26** | gateway WebSocket, gerador de carga | Uma goroutine por conexão é o par natural de um processo por conexão, e o `net/http` com `Hijacker` dá o socket cru sem intermediário. É também a comparação que o projeto quer: a plataforma onde "um por conexão" é barato **sem** supervisão nem isolamento de falha | **Node.js**: um laço de eventos, não um por conexão — mediria outra coisa. **Rust**: mais rápido e sem GC, mas `async` exige escolher runtime, e aí a medição seria do Tokio |
 | **`ws/` escrito à mão** (zero dependências) | aperto de mão e quadros da RFC 6455 | O custo por conexão é dominado pelos buffers, e em biblioteca eles são escolha dela. Com `ws.Config` explícito, a tabela de efeito dos buffers existe — e ela mostra +35 % para o padrão herdado | **gorilla/websocket**, **coder/websocket**: ambas boas e livres; esconderiam justamente a variável sob medição |
 | **HCL + OpenTofu 1.13** | `infra/`, a infraestrutura dos benchmarks | Declara rede, NATS e o gateway construído do fonte. Existe para responder **o que o HCL acrescenta a um `docker run`**, com cinco propriedades verificadas por máquina em `verifica.sh`: convergência, idempotência, detecção de desvio, grafo derivado de referências, e destruição completa. A chave é `plan -detailed-exitcode`, que transforma "detecta desvio" em código de saída | **Terraform**: passou para BUSL em 2023, que não é open source pela OSI. OpenTofu é o fork MPL-2.0 da Linux Foundation e lê o mesmo HCL. Mesma decisão que levou a NATS em vez de Redpanda |
-| **Clojure 1.12** | `clojure/contencao`, contenção em estado compartilhado | O `Mesh.Stats` serializa contadores por caixa de mensagens; Clojure oferece quatro coordenações alternativas (atom, ref/STM, agent, mais o `AtomicLong` do JDK) e medi-las diz o que o padrão da BEAM custa e compra. Achou que `agent` e `GenServer` ficam na mesma ordem de grandeza (~0,5 M ops/s, com a diferença **dentro do ruído** — ver a correção na seção), que `:counters` bate `AtomicLong` por 3,4x, e que a versão sem coordenação é a mais rápida **e perde 70% das atualizações** | **core.async**: traria seu próprio escalonador e mediria a biblioteca, não a linguagem. Atom, ref e agent são todos de `clojure.core` — o projeto segue sem dependências |
+| **Clojure 1.12** | `clojure/contencao`, contenção em estado compartilhado | O `Mesh.Stats` serializa contadores por caixa de mensagens; Clojure oferece quatro coordenações alternativas (atom, ref/STM, agent, mais o `AtomicLong` do JDK) e medi-las diz o que o padrão da BEAM custa e compra. Achou que `agent` e `GenServer` ficam na mesma ordem de grandeza (~0,5 M ops/s, com a diferença **dentro do ruído** — ver a correção na seção), que `:counters` bate `AtomicLong` por 1,19x a 2,97x (faixas disjuntas, 7 reps alternadas), e que a versão sem coordenação é a mais rápida **e perde 70% das atualizações** | **core.async**: traria seu próprio escalonador e mediria a biblioteca, não a linguagem. Atom, ref e agent são todos de `clojure.core` — o projeto segue sem dependências |
 | **Scala 3.10 + JDK 25** | `scala/loadgen`, custo e escalonamento da concorrência | Loom promete o que a BEAM promete — "crie uma por conexão" — e a comparação direta é o que dá sentido aos 3.534 bytes do projeto. Resultado: a thread virtual é **mais barata** (1.323 contra 2.732 bytes) e **sofre inanição completa** sob carga de CPU, onde a BEAM degrada 21x. Mede também o muro da thread de plataforma: 30.568 e OOM | **Akka/Pekko ou Cats Effect**: trariam seu próprio escalonador e mediriam a biblioteca, não a plataforma. O JDK tem `Thread.ofVirtual` e cliente WebSocket embutidos, então o projeto segue sem dependências |
 | **Rust 1.93 + rustler** | `native/mesh_nif`, codec como NIF | Existe para **medir o custo da travessia** BEAM↔nativo, que é a decisão que todo projeto BEAM enfrenta e quase ninguém mede. Resultado: ~30 ns por chamada, e o NIF não venceu acima do ruído em nenhum tamanho até 1 MiB | **NIF à mão contra a ABI do `erl_nif.h`**: dezenas de linhas de `unsafe extern "C"` e conversão manual de termos — mediria a qualidade do meu boilerplate, não o custo real. `rustler` é o que se usaria de verdade |
 | **Gleam 1.19** | `gleam/mesh_codec`, terceira implementação do protocolo | Tipagem estática sobre a BEAM: o quadro deixa de ser convenção e passa a ser tipo, e três classes de erro migram de tempo de execução para tempo de compilação. O `@external` para `file:read_file/1` mostra que chamar OTP de Gleam é chamada de função, não FFI | **`simplifile`** para o I/O: traria dependência e esconderia justamente o ponto de que Gleam é BEAM |
@@ -1385,9 +1563,15 @@ etapa.
   mil ops/s e `cast` mais lento que `call` pareciam bug de benchmark. Eram
   contenção de chave única (`write_concurrency` fragmenta **por chave**, e na
   mesma chave adicionar núcleos deixa 200x mais lento) e falta de contrapressão
-  (a caixa chegou a 811 mil mensagens; `off_heap` rende 254x sob contenção e
+  (a caixa chegou a 811 mil mensagens; `off_heap` rende ~66x sob contenção e
   custa 2,8x sem ela). **Anomalia implausível é informação sobre o sistema** —
   mas só depois de verificar o instrumento.
+- **Dispersão alta pode ser a assinatura do fenômeno, não do relógio.** Na
+  tabela de contenção refeita, os dois mecanismos com dispersão acima de 100%
+  são justamente `:atomics` (113,9%) e `cast` on-heap (164,1%) — os que
+  disputam recurso compartilhado sem fragmentação. Uma caixa que cresce sem
+  limite **não produz tempo repetível**, e isso é informação sobre a
+  patologia.
 - **O mecanismo mais rápido pode estar errado, e o correto pode custar o
   mesmo.** Sem coordenação: 32,0 M ops/s e 70% das atualizações perdidas, em
   silêncio. `AtomicLong`: 31,1 M e nenhuma. Não havia troca a fazer.

@@ -86,6 +86,51 @@ melhor_de_n() {
   echo "$melhor"
 }
 
+# ------------------------------------------------- modo --esperar
+#
+# A calibração DEPOIS da medição tem um problema que a de antes não tem: ela
+# mede, em parte, o calor que o próprio benchmark gerou. Num laptop, 14
+# execuções pesadas seguidas reduzem a frequência, e a calibração final reprova
+# por causa da medição, não por causa de carga externa.
+#
+# `--esperar` resolve distinguindo os dois casos: espera a máquina voltar à
+# faixa, com um teto de tentativas. Se voltar, era o próprio benchmark
+# aquecendo e o resultado vale. Se não voltar, há carga externa de verdade.
+if [ "${1:-}" = "--esperar" ]; then
+  max="${CAL_TENTATIVAS:-6}"
+
+  if [ ! -f "$BASE_ARQ" ]; then
+    echo "sem linha de base; rode: bash bench/calibra.sh --gravar" >&2
+    exit 2
+  fi
+
+  base=$(cat "$BASE_ARQ")
+
+  for tentativa in $(seq 1 "$max"); do
+    agora=$(melhor_de_n)
+    excesso=$(awk -v a="$agora" -v b="$base" 'BEGIN { printf "%.1f", (a - b) / b * 100 }')
+
+    if awk -v e="$excesso" -v t="$TOLERANCIA" 'BEGIN { exit !(e <= t) }'; then
+      printf 'calibração final: %s ms (base %s ms, %+.1f%%) — ok na tentativa %s
+'         "$agora" "$base" "$excesso" "$tentativa"
+      exit 0
+    fi
+
+    printf 'calibração final: %s ms (%+.1f%%) — fora da faixa, esfriando (%s/%s)
+'       "$agora" "$excesso" "$tentativa" "$max"
+    sleep 10
+  done
+
+  cat <<TXT
+  A máquina NÃO voltou à faixa em $max tentativas (~$((max * 10))s de espera).
+
+  Isso distingue dois casos, e aqui é o segundo:
+    * voltou  -> era o próprio benchmark aquecendo a CPU; o resultado vale;
+    * não voltou -> há carga externa de verdade.
+TXT
+  exit 1
+fi
+
 if [ "${1:-}" = "--gravar" ]; then
   echo "Gravando a linha de base. A máquina deve estar OCIOSA:"
   echo "  sem navegador tocando vídeo, sem jogo, sem build em outra janela."

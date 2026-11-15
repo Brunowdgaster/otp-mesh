@@ -166,7 +166,7 @@ done
 # --------------------------------------- regra 3 (de novo): calibração final
 echo
 CONTAMINADO=0
-if ! bash bench/calibra.sh; then
+if ! bash bench/calibra.sh --esperar; then
   echo
   echo "AS CONDIÇÕES MUDARAM DURANTE A MEDIÇÃO."
   echo "A calibração passou antes e reprovou depois: algo começou a rodar no"

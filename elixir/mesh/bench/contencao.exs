@@ -43,6 +43,14 @@
 
 esperado = n_workers * por_worker
 
+# Repetições por mecanismo. A primeira versão deste benchmark media UMA vez
+# cada um e publicava a tabela sem dispersão -- e duas linhas dela ficavam a
+# 0,04% e 6,5% de distância, onde afirmar qualquer ordem é invenção.
+#
+# `:ets, 1 chave` e `GenServer cast` levam ~95 s cada por repetição, então o
+# padrão é 3. Com REPS=5 a execução passa de 15 minutos.
+reps = String.to_integer(System.get_env("REPS") || "3")
+
 defmodule Contador do
   @moduledoc "GenServer com um contador, no mesmo espírito do Mesh.Stats."
   use GenServer
@@ -119,6 +127,31 @@ medir = fn corpo, ler ->
   }
 end
 
+# Roda a estratégia `reps` vezes e devolve a MELHOR vazão mais a dispersão.
+#
+# Melhor, e não média: a média mistura a execução contaminada com as limpas.
+# E a dispersão ao lado, porque número sem dispersão não é medição -- foi
+# exatamente o que faltava na primeira versão desta tabela.
+melhor_de = fn f ->
+  amostras = Enum.map(1..reps, fn _ -> f.() end)
+
+  # Falha alto se QUALQUER repetição contou errado, não só a última.
+  erradas = Enum.reject(amostras, & &1.correto?)
+
+  taxas = Enum.map(amostras, & &1.ops_s)
+  melhor = Enum.max(taxas)
+  pior = Enum.min(taxas)
+
+  %{
+    ops_s: melhor,
+    pior: pior,
+    disp: Float.round((melhor - pior) / max(pior, 1) * 100, 1),
+    ms: amostras |> Enum.map(& &1.ms) |> Enum.min(),
+    final: hd(amostras).final,
+    correto?: erradas == []
+  }
+end
+
 IO.puts("""
 
 === Estado compartilhado sob contencao (BEAM) ===
@@ -127,6 +160,7 @@ otp          : #{:erlang.system_info(:otp_release)}
 escalonadores: #{:erlang.system_info(:schedulers_online)}
 workers      : #{n_workers}, cada um com #{por_worker} incrementos
 esperado     : #{esperado}
+reps         : #{reps} por mecanismo, melhor vazao, dispersao reportada
 """)
 
 estrategias = [
@@ -247,24 +281,26 @@ estrategias = [
 
 IO.puts(
   String.pad_trailing("mecanismo", 22) <>
-    String.pad_leading("ms", 11) <>
-    String.pad_leading("ops/s", 14) <>
-    String.pad_leading("final", 12) <>
-    String.pad_leading("correto?", 10)
+    String.pad_leading("ms", 10) <>
+    String.pad_leading("ops/s", 13) <>
+    String.pad_leading("disp", 9) <>
+    String.pad_leading("final", 11) <>
+    String.pad_leading("ok?", 9)
 )
 
-IO.puts(String.duplicate("-", 69))
+IO.puts(String.duplicate("-", 72))
 
 resultados =
   Enum.map(estrategias, fn {nome, f} ->
-    r = f.()
+    r = melhor_de.(f)
 
     IO.puts(
       String.pad_trailing(nome, 22) <>
-        String.pad_leading("#{r.ms}", 11) <>
-        String.pad_leading("#{r.ops_s}", 14) <>
-        String.pad_leading("#{r.final}", 12) <>
-        String.pad_leading(if(r.correto?, do: "sim", else: "NAO"), 10)
+        String.pad_leading("#{r.ms}", 10) <>
+        String.pad_leading("#{r.ops_s}", 13) <>
+        String.pad_leading("#{r.disp}%", 9) <>
+        String.pad_leading("#{r.final}", 11) <>
+        String.pad_leading(if(r.correto?, do: "sim", else: "NAO"), 9)
     )
 
     {nome, r}
@@ -341,7 +377,19 @@ IO.puts("""
   `cast` a remove. Mesmo tema da secao de contrapressao do projeto, em outra
   escala.
 
-  3. O GenServer nao e desperdicio
+  3. Pares que a dispersao NAO separa
+  -----------------------------------------------------------
+  Duas distancias desta tabela sao pequenas demais para a ordem significar
+  algo, e a primeira versao dela (sem dispersao) afirmava uma ordem:
+
+    :atomics  x  :ets 1 chave/worker   -- ficaram a 0,04% na medicao original
+    GenServer cast  x  :ets 1 chave     -- ficaram a 6,5%
+
+  Com a dispersao ao lado, compare: se ela for maior que a distancia, os dois
+  mecanismos sao INDISTINGUIVEIS nesta maquina, e a tabela nao autoriza dizer
+  qual e mais rapido.
+
+  4. O GenServer nao e desperdicio
   -----------------------------------------------------------
   Ele e o padrao idiomatico e e o que o Mesh.Stats usa: processo
   supervisionado, estado isolado, reiniciavel sem levar o resto. `:counters`
